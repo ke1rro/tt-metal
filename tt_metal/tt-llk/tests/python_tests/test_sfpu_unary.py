@@ -493,6 +493,61 @@ DOMAIN_CUSTOM_TOLERANCES = {
 }
 
 
+@pytest.mark.parametrize("mathop", [MathOperation.Fmod, MathOperation.Remainder])
+@pytest.mark.parametrize("dest_acc", [DestAccumulation.No, DestAccumulation.Yes])
+def test_eltwise_unary_sfpu_modulo_boundaries(mathop, dest_acc):
+    # The unary kernels use a fixed divisor of 2.0 in the LLK harness. Exercise exact
+    # multiples and their adjacent FP32 values, both signs, and exponent boundaries where
+    # FP32 progressively loses fractional bits.
+    values = []
+    boundary_values = (
+        [
+            0.0,
+            2.0**-10,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            8.0,
+            2.0**10,
+            2.0**20,
+            2.0**22,
+            2.0**23,
+            2.0**24,
+        ]
+        if dest_acc == DestAccumulation.Yes
+        else [0.0, 2.0, 4.0, 8.0, 2.0**23]
+    )
+    for value in boundary_values:
+        value_f32 = torch.tensor(value, dtype=torch.float32)
+        values.append(value)
+        if value != 0.0:
+            # SFPU arithmetic flushes denormals, so adjacent values around zero do not
+            # have ordinary FP32 remainder semantics and are covered separately.
+            values.extend(
+                [
+                    float(torch.nextafter(value_f32, torch.tensor(float("-inf")))),
+                    float(torch.nextafter(value_f32, torch.tensor(float("inf")))),
+                ]
+            )
+    values.extend([-value for value in values if value != 0.0])
+
+    eltwise_unary_sfpu(
+        "sources/eltwise_unary_sfpu_test.cpp",
+        InputOutputFormat(DataFormat.Float32, DataFormat.Float32),
+        dest_acc,
+        ApproximationMode.No,
+        mathop,
+        FastMode.No,
+        [32, 32],
+        spec_A=StimuliSpec.custom(values),
+        custom_atol=0.0,
+        custom_rtol=0.0,
+    )
+
+
 # Large matrix (2 formats x ~52 ops x 2 dest_acc); nightly-gated to keep presubmit fast.
 @pytest.mark.nightly
 @parametrize(

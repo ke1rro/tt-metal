@@ -1241,29 +1241,11 @@ void call_unary_sfpu_operation(std::uint32_t dst_index, std::uint32_t math_forma
     }
     else if constexpr (OPERATION == SfpuType::fmod)
     {
-        // calculate_fmod takes (value, recip); the bodies read vConstFloatPrgm0/1 set by init,
-        // so the runtime args are inert but the signature still requires them. Mirror init.
-        SFPU_UNARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_fmod,
-            (APPROX_MODE, ITERATIONS),
-            dst_index,
-            vector_mode,
-            0x40000000u /* value = 2.0f */,
-            0x3f000000u /* recip = 0.5f */);
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_fmod, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
     }
     else if constexpr (OPERATION == SfpuType::remainder)
     {
-        SFPU_UNARY_CALL(
-            DST_SYNC_MODE,
-            DST_ACCUM_MODE,
-            calculate_remainder,
-            (APPROX_MODE, ITERATIONS),
-            dst_index,
-            vector_mode,
-            0x40000000u /* value = 2.0f */,
-            0x3f000000u /* recip = 0.5f */);
+        SFPU_UNARY_CALL(DST_SYNC_MODE, DST_ACCUM_MODE, calculate_remainder, (APPROX_MODE, ITERATIONS), dst_index, vector_mode);
     }
     else if constexpr (OPERATION == SfpuType::unary_gt)
     {

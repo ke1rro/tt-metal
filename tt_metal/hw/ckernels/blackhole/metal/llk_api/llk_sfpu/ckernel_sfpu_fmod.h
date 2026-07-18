@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include "ckernel.h"
 #include "ckernel_defs.h"
 #include "ckernel_sfpu_recip.h"
@@ -13,7 +14,7 @@ namespace ckernel {
 namespace sfpu {
 
 template <bool APPROXIMATION_MODE>
-inline void init_fmod(const uint value, const uint recip) {
+inline void init_fmod(const std::uint32_t value, const std::uint32_t recip) {
     sfpi::vConstFloatPrgm0 = Converter::as_float(value);
     sfpi::vConstFloatPrgm1 = Converter::as_float(recip);
 }
@@ -30,34 +31,37 @@ inline void calculate_fmod() {
         sfpi::vFloat v = sfpi::abs(val);
 
         sfpi::vFloat quotient;
-        sfpi::vInt exp = sfpi::exexp(v * recip_val);
+        const sfpi::vFloat scaled = v * recip_val;
+        sfpi::vInt exp = sfpi::exexp(scaled);
         v_if(exp < 0) { quotient = 0.0f; }
         // Since fp32 has 23 mantissa bits, the LSB represents the fractional part when exp < 23.
         // We effectively round off the fractional bits to zero by right shifting using (exp - 23) and then left
         // shifting it back using (0 - (exp - 23)).
         v_elseif(exp < 23) {
-            quotient = sfpi::as<sfpi::vFloat>(
-                shft((shft(sfpi::as<sfpi::vUInt>(v * recip_val), (exp - 23))), (0 - (exp - 23))));
+            quotient =
+                sfpi::as<sfpi::vFloat>(shft((shft(sfpi::as<sfpi::vUInt>(scaled), (exp - 23))), (0 - (exp - 23))));
         }
-        v_else { quotient = v * recip_val; }
+        v_else { quotient = scaled; }
         v_endif
 
-        v_if(quotient > v * recip_val) {
+        v_if(quotient > scaled) {
             quotient = quotient - 1;
         }
         v_endif;
         v = v - quotient * s;
+
+        // Normalize the FP32 residual around integer boundaries before restoring fmod's
+        // dividend sign. Avoid the former ten predicated correction blocks.
+        v_if(v >= s) { v = v - s; }
+        v_endif;
+        v_if(v < 0.0f) { v = v + s; }
+        v_endif;
 
         v = sfpi::copysgn(v, val);
 
         v_if(s == 0) { v = std::numeric_limits<float>::quiet_NaN(); }
         v_endif;
 
-        constexpr auto iter = 10;
-        for (int l = 0; l < iter; l++) {
-            v_if(v >= s) { v = s - v; }
-            v_endif;
-        }
         v_if(sfpi::abs(v) - s == 0.0f) { v = 0.0f; }
         v_endif;
         sfpi::dst_reg[0] = v;
