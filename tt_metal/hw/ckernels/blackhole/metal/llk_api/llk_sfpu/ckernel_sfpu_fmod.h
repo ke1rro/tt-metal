@@ -50,18 +50,16 @@ inline void calculate_fmod() {
         v_endif;
         v = v - quotient * s;
 
-        // Normalize the FP32 residual around integer boundaries before restoring fmod's
-        // dividend sign. Avoid the former ten predicated correction blocks.
-        v_if(v >= s) { v = v - s; }
-        v_endif;
-        v_if(v < 0.0f) { v = v + s; }
-        v_endif;
-
         v = sfpi::copysgn(v, val);
 
         v_if(s == 0) { v = std::numeric_limits<float>::quiet_NaN(); }
         v_endif;
 
+        constexpr auto iter = 10;
+        for (int l = 0; l < iter; l++) {
+            v_if(v >= s) { v = s - v; }
+            v_endif;
+        }
         v_if(sfpi::abs(v) - s == 0.0f) { v = 0.0f; }
         v_endif;
         sfpi::dst_reg[0] = v;

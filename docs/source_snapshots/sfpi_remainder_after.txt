@@ -1,3 +1,9 @@
+# Snapshot: final caching-only Blackhole scalar SFPI remainder source
+# Base commit: 375862277bcb2b3ef89a2543b090f8dbf3eb49d7
+# Original path: tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_remainder.h
+# The unsafe two-correction candidate has been removed; baseline correction behavior is retained.
+# This metadata block is not part of the compilable header.
+
 // SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -14,21 +20,22 @@ namespace ckernel {
 namespace sfpu {
 
 template <bool APPROXIMATION_MODE>
-inline void init_fmod(const std::uint32_t value, const std::uint32_t recip) {
+inline void init_remainder(const std::uint32_t value, const std::uint32_t recip) {
     sfpi::vConstFloatPrgm0 = Converter::as_float(value);
     sfpi::vConstFloatPrgm1 = Converter::as_float(recip);
 }
 
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-inline void calculate_fmod() {
+inline void calculate_remainder() {
     // SFPU microcode
-    sfpi::vFloat s = sfpi::abs(sfpi::vConstFloatPrgm0);
+    sfpi::vFloat value_tmp = sfpi::vConstFloatPrgm0;
+    sfpi::vFloat s = sfpi::abs(value_tmp);
     sfpi::vFloat recip_val = sfpi::abs(sfpi::vConstFloatPrgm1);
 
 #pragma GCC unroll 0
     for (int d = 0; d < ITERATIONS; d++) {
-        sfpi::vFloat val = sfpi::dst_reg[0];
-        sfpi::vFloat v = sfpi::abs(val);
+        vFloat val = sfpi::dst_reg[0];
+        vFloat v = sfpi::abs(val);
 
         vFloat quotient;
         const vFloat scaled = v * recip_val;
@@ -50,8 +57,12 @@ inline void calculate_fmod() {
         v_endif;
         v = v - quotient * s;
 
-        v = sfpi::copysgn(v, val);
+        v_if(val < 0 && v != 0) { v = s - v; }
+        v_endif;
 
+        v_if(value_tmp < 0 && v != 0) { v = v + value_tmp; }
+        v_endif;
+        v = sfpi::copysgn(v, value_tmp);
         v_if(s == 0) { v = std::numeric_limits<float>::quiet_NaN(); }
         v_endif;
 

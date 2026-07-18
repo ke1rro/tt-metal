@@ -1,10 +1,14 @@
+# Snapshot: baseline Blackhole scalar SFPI remainder source
+# Source commit: 42027fc7642202d17346a5065c37530cf7e06604
+# Original path: tt_metal/hw/ckernels/blackhole/metal/llk_api/llk_sfpu/ckernel_sfpu_remainder.h
+# This metadata block is not part of the compilable header.
+
 // SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <cstdint>
 #include "ckernel.h"
 #include "ckernel_defs.h"
 #include "ckernel_sfpu_recip.h"
@@ -14,44 +18,48 @@ namespace ckernel {
 namespace sfpu {
 
 template <bool APPROXIMATION_MODE>
-inline void init_fmod(const std::uint32_t value, const std::uint32_t recip) {
+inline void init_remainder(const uint value, const uint recip) {
     sfpi::vConstFloatPrgm0 = Converter::as_float(value);
     sfpi::vConstFloatPrgm1 = Converter::as_float(recip);
 }
 
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-inline void calculate_fmod() {
+inline void calculate_remainder() {
     // SFPU microcode
-    sfpi::vFloat s = sfpi::abs(sfpi::vConstFloatPrgm0);
+    sfpi::vFloat value_tmp = sfpi::vConstFloatPrgm0;
+    sfpi::vFloat s = sfpi::abs(value_tmp);
     sfpi::vFloat recip_val = sfpi::abs(sfpi::vConstFloatPrgm1);
 
 #pragma GCC unroll 0
     for (int d = 0; d < ITERATIONS; d++) {
-        sfpi::vFloat val = sfpi::dst_reg[0];
-        sfpi::vFloat v = sfpi::abs(val);
+        vFloat val = sfpi::dst_reg[0];
+        vFloat v = sfpi::abs(val);
 
         vFloat quotient;
-        const vFloat scaled = v * recip_val;
-        vInt exp = sfpi::exexp(scaled);
+        vInt exp = sfpi::exexp(v * recip_val);
         v_if(exp < 0) { quotient = 0.0f; }
         // Since fp32 has 23 mantissa bits, the LSB represents the fractional part when exp < 23.
         // We effectively round off the fractional bits to zero by right shifting using (exp - 23) and then left
         // shifting it back using (0 - (exp - 23)).
         v_elseif(exp < 23) {
-            quotient =
-                sfpi::as<sfpi::vFloat>(shft((shft(sfpi::as<sfpi::vUInt>(scaled), (exp - 23))), (0 - (exp - 23))));
+            quotient = sfpi::as<sfpi::vFloat>(
+                shft((shft(sfpi::as<sfpi::vUInt>(v * recip_val), (exp - 23))), (0 - (exp - 23))));
         }
-        v_else { quotient = scaled; }
+        v_else { quotient = v * recip_val; }
         v_endif
 
-        v_if(quotient > scaled) {
+        v_if(quotient > v * recip_val) {
             quotient = quotient - 1;
         }
         v_endif;
         v = v - quotient * s;
 
-        v = sfpi::copysgn(v, val);
+        v_if(val < 0 && v != 0) { v = s - v; }
+        v_endif;
 
+        v_if(value_tmp < 0 && v != 0) { v = v + value_tmp; }
+        v_endif;
+        v = sfpi::copysgn(v, value_tmp);
         v_if(s == 0) { v = std::numeric_limits<float>::quiet_NaN(); }
         v_endif;
 

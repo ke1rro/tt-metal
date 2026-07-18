@@ -1,0 +1,73 @@
+# Final caching-only scalar SFPI remainder disassembly
+# Symbol: void ckernel::sfpu::calculate_remainder<false, 32>()
+# Architecture: Blackhole
+# Tool: riscv-tt-elf-objdump -d -C
+# Encoded instructions in symbol: 65
+# Optimization: cached reciprocal product; baseline correction replay retained.
+
+0000b8b8 <void ckernel::sfpu::calculate_remainder<false, 32>()>:
+    b8b8:	f4003045          	sfpabs	L1,L12,1
+    b8bc:	f4003485          	sfpabs	L2,L13,1
+    b8c0:	02000793          	li	a5,32
+    b8c4:	c0c38001          	sfpload	L3,0,0,7
+    b8c8:	f4000d05          	sfpabs	L4,L3,1
+    b8cc:	1810a542          	sfpmul	L5,L4,L2,0
+    b8d0:	dc001409          	sfpexexp	L0,L5,2
+    b8d4:	2c000002          	sfpcompc
+    b8d8:	1c000002          	sfppushc	0
+    b8dc:	e7fa4185          	sfpiadd	L6,L0,0xFE9,1
+    b8e0:	e7fa4195          	sfpiadd	L6,L0,0xFE9,5
+    b8e4:	f00015c9          	sfpmov	L7,L5,2
+    b8e8:	e80019c1          	sfpshft	L7,L6,0x000,0
+    b8ec:	e7fa4195          	sfpiadd	L6,L0,0xFE9,5
+    b8f0:	e4002599          	sfpiadd	L6,L9,0x000,6
+    b8f4:	f0002409          	sfpmov	L0,L9,2
+    b8f8:	f0001c01          	sfpmov	L0,L7,0
+    b8fc:	e8001801          	sfpshft	L0,L6,0x000,0
+    b900:	2c000002          	sfpcompc
+    b904:	f0001401          	sfpmov	L0,L5,0
+    b908:	20000002          	sfppopc	0
+    b90c:	2800c02a          	sfpencc	0x003,10
+    b910:	1016c142          	sfpmad	L5,L5,L11,L0,0
+    b914:	ec001411          	sfpsetcc	L5,0x000,4
+    b918:	ec001409          	sfpsetcc	L5,0x000,2
+    b91c:	142a8006          	sfpadd	L0,L10,L0,1
+    b920:	2800c02a          	sfpencc	0x003,10
+    b924:	10005006          	sfpmad	L0,L0,L1,L4,1
+    b928:	ec000c01          	sfpsetcc	L3,0x000,0
+    b92c:	ec000009          	sfpsetcc	L0,0x000,2
+    b930:	14280406          	sfpadd	L0,L0,L1,1
+    b934:	2800c02a          	sfpencc	0x003,10
+    b938:	ec003001          	sfpsetcc	L12,0x000,0
+    b93c:	ec000009          	sfpsetcc	L0,0x000,2
+    b940:	14283002          	sfpadd	L0,L0,L12,0
+    b944:	f00000c9          	sfpmov	L3,L0,2
+    b948:	2800c02a          	sfpencc	0x003,10
+    b94c:	f0003009          	sfpmov	L0,L12,2
+    b950:	24000c02          	sfpsetsgn	L0,L3,0x000,0
+    b954:	ec000419          	sfpsetcc	L1,0x000,6
+    b958:	c401ff01          	sfploadi	L0,32704,0
+    b95c:	1000020c          	ttreplay	0,8,1,1
+    b960:	2800c02a          	sfpencc	0x003,10
+    b964:	1006c0c2          	sfpmad	L3,L1,L11,L0,0
+    b968:	ec000c11          	sfpsetcc	L3,0x000,4
+    b96c:	14280406          	sfpadd	L0,L0,L1,1
+    b970:	2800c02a          	sfpencc	0x003,10
+    b974:	1006c0c2          	sfpmad	L3,L1,L11,L0,0
+    b978:	ec000c11          	sfpsetcc	L3,0x000,4
+    b97c:	14280406          	sfpadd	L0,L0,L1,1
+    b980:	10000200          	ttreplay	0,8,0,0
+    b984:	10000200          	ttreplay	0,8,0,0
+    b988:	10000200          	ttreplay	0,8,0,0
+    b98c:	10000200          	ttreplay	0,8,0,0
+    b990:	2800c02a          	sfpencc	0x003,10
+    b994:	f40000c5          	sfpabs	L3,L0,1
+    b998:	14284cc6          	sfpadd	L3,L1,L3,1
+    b99c:	ec000c19          	sfpsetcc	L3,0x000,6
+    b9a0:	f0002401          	sfpmov	L0,L9,0
+    b9a4:	2800c02a          	sfpencc	0x003,10
+    b9a8:	c8038001          	sfpstore	L0,0,0,7
+    b9ac:	e0020000          	ttincrwc	0,2,0,0
+    b9b0:	fff78793          	addi	a5,a5,-1
+    b9b4:	f00798e3          	bnez	a5,b8c4 <void ckernel::sfpu::calculate_remainder<false, 32>()+0xc>
+    b9b8:	00008067          	ret

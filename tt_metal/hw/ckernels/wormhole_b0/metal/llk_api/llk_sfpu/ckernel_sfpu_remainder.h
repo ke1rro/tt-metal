@@ -51,13 +51,6 @@ inline void calculate_remainder() {
         v_endif;
         v = v - quotient * s;
 
-        // Normalize the FP32 residual around integer boundaries before applying remainder's
-        // sign policy. This replaces ten unconditional predicated correction blocks in the hot path.
-        v_if(v >= s) { v = v - s; }
-        v_endif;
-        v_if(v < 0.0f) { v = v + s; }
-        v_endif;
-
         v_if(val < 0 && v != 0) { v = s - v; }
         v_endif;
 
@@ -67,6 +60,11 @@ inline void calculate_remainder() {
         v_if(s == 0) { v = std::numeric_limits<float>::quiet_NaN(); }
         v_endif;
 
+        constexpr auto iter = 10;
+        for (int l = 0; l < iter; l++) {
+            v_if(v >= s) { v = s - v; }
+            v_endif;
+        }
         v_if(sfpi::abs(v) - s == 0.0f) { v = 0.0f; }
         v_endif;
         sfpi::dst_reg[0] = v;
