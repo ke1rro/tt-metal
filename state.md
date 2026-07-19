@@ -10,8 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `86ba7d8b5eafae2c2799065b94fea8f145b67522`
-- HEAD subject: `wip`
+- HEAD: `75855e3002` (`research: exhaustive fixed-schedule scalar modulo validation`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -24,11 +23,9 @@ well as verified results.
 - The four production headers in HEAD retain the old ten-block correction
   behavior and only cache `scaled = v * recip_val`. Current uncommitted work does
   not modify production headers.
-- Current uncommitted changes retain the earlier diagnostic/hybrid and
-  fixed-stage chunked Architecture A research, and add the Architecture B
-  scalar-fixed schedule: exact Python/C++ models, exhaustive sweeps, test-only
-  device prototypes, correctness/performance probes, disassembly analysis, and
-  reports. They do not modify production headers.
+- Current uncommitted work adds a host-only exponent-stationary Architecture B
+  follow-up to the checkpointed fixed schedule. It changes only the two host
+  models and research documentation; production and SFPI headers are untouched.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -671,21 +668,58 @@ separate explicit caller-contract specialization and continue hardening this
 fixed schedule as `Robust`. Do not call it globally robust until the documented
 finite-normal exclusions are closed.
 
+## Exponent-stationary host result
+
+The host-only follow-up keeps the reduction divisor at unbiased exponent 111,
+scales the residual upward between stages, and forms the physical normal or
+subnormal result with an exact integer RNE pack. Mandatory exponent-127
+pre-halving permits the corrected initial schedule `K0=max(111-Eb,0)`; using the
+old `112-Eb` schedule in a 111 frame would underflow the smallest inputs during
+initial scaling.
+
+The primary smallest-normal-divisor gate passed:
+
+```text
+Passed                 2,130,706,432
+IntermediateSubnormal              0
+other exclusions                   0
+failures                           0
+final subnormal results   184,549,377  # packed as raw bits
+```
+
+The old physical-frame control histogram locates every one of its 184,549,377
+exclusions at `AfterHighSubtract`; all have subnormal exact final results and
+96,467,969 are negative before correction.
+
+Complete positive-normal input sweeps passed for 14 divisors: four exponent
+`-126` mantissa boundaries, the previous nine representative divisors, and
+`FLT_MAX`. Total: `29,829,890,048` accepted pairs with no exclusion or mismatch.
+The independent Python model passed 458,214 deterministic/BF16/selected cases
+and 100,582 arbitrary-normal-divisor cases with zero exclusion and quotient
+error `[0,+1]`. See
+`docs/SFPI_SCALAR_MODULO_EXPONENT_STATIONARY_RESEARCH.md`.
+
+This is host evidence only. No exponent-stationary SFPI/device code or new
+performance measurement exists yet.
+
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Define special-value, zero-divisor, signed-zero, subnormal, and FTZ semantics,
-   then extend the exact transient model instead of counting exclusions as
-   successes.
-3. Choose and prove an integer/raw or explicitly restricted strategy for the
-   observed FTZ-domain cases.
-4. Review the two explicit Architecture B contracts with the TT/SFPI owner:
+2. Implement the exponent-stationary reducer in a new test-only SFPI helper,
+   including raw normal/subnormal packing without spills or floating-store FTZ.
+3. Perform floor-remainder `D-R` sign adjustment before packing and preserve
+   exact-zero sign; add the high-divisor `a<b` bypass.
+4. Compile/disassemble Blackhole and Wormhole, then run Blackhole raw-bit FTZ,
+   top-range, correctness, register-pressure, and lane-mix performance tests.
+5. Define special-value, zero-divisor, signed-zero, subnormal-input, and FTZ
+   policy at the operator boundary.
+6. Review the two explicit Architecture B contracts with the TT/SFPI owner:
    `FastBounded` selected only from proven range metadata, and fixed-schedule
    `Robust` as the generic path after its exclusions are closed.
-5. Obtain real Wormhole runtime correctness/performance and tune its dependency
+7. Obtain real Wormhole runtime correctness/performance and tune its dependency
    schedule; current Wormhole evidence is compile/disassembly only.
-6. Make no production change until the robust proof domain and API/dispatch
+8. Make no production change until the robust proof domain and API/dispatch
    contract are approved; then rerun host, raw-bit device, disassembly, register,
    lane-mix, and TTNN validation.
 
@@ -704,3 +738,5 @@ finite-normal exclusions are closed.
 - Keep special-value policy explicitly unresolved. Treat FTZ/subnormal behavior
   as measured only for the documented smallest-normal-divisor Blackhole probes;
   do not generalize it to all inputs or to Wormhole without hardware evidence.
+- Treat the exponent-stationary result as host-only; do not claim device
+  correctness or performance until the raw pack and reducer run on hardware.

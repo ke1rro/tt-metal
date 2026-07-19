@@ -30,6 +30,7 @@ constexpr std::uint32_t kPositiveNormalBegin = 0x00800000u;
 constexpr std::uint32_t kMantissaMask = 0x007fffffu;
 constexpr int kInitialDivisorExponent = 112;
 constexpr int kChunkStep = 15;
+constexpr int kDefaultWorkingExponent = 111;
 
 enum class Outcome : std::uint32_t {
     Passed,
@@ -76,6 +77,52 @@ constexpr std::array<std::string_view, static_cast<std::size_t>(Outcome::Count)>
     "InternalInvariant",
 };
 
+enum class SubnormalPoint : std::uint32_t {
+    None,
+    InitialScaling,
+    QuotientProduct,
+    DivisorHigh,
+    DivisorLow,
+    HighProduct,
+    LowProduct,
+    AfterHighSubtract,
+    AfterLowSubtract,
+    AfterCorrection,
+    InterstageScale,
+    FinalResult,
+    Count,
+};
+
+constexpr std::array<std::string_view, static_cast<std::size_t>(SubnormalPoint::Count)> kSubnormalPointNames = {
+    "None",
+    "InitialScaling",
+    "QuotientProduct",
+    "DivisorHigh",
+    "DivisorLow",
+    "HighProduct",
+    "LowProduct",
+    "AfterHighSubtract",
+    "AfterLowSubtract",
+    "AfterCorrection",
+    "InterstageScale",
+    "FinalResult",
+};
+
+enum class ValueClass : std::uint32_t {
+    Zero,
+    Subnormal,
+    Normal,
+    Special,
+    Count,
+};
+
+constexpr std::array<std::string_view, static_cast<std::size_t>(ValueClass::Count)> kValueClassNames = {
+    "Zero",
+    "Subnormal",
+    "Normal",
+    "Special",
+};
+
 struct Options {
     std::uint32_t divisor_bits = 0x40400000u;
     std::uint64_t input_begin = kPositiveNormalBegin;
@@ -88,6 +135,8 @@ struct Options {
     std::string dump_exclusions;
     bool stop_on_failure = false;
     bool prehalve_max_exponent = false;
+    bool exponent_stationary = false;
+    int working_exponent = kDefaultWorkingExponent;
 };
 
 struct FloatParts {
@@ -101,10 +150,22 @@ struct FloatParts {
 
 struct Config {
     std::uint32_t divisor_bits = 0;
+    std::uint32_t reduction_divisor_bits = 0;
     std::uint32_t reciprocal_up_bits = 0;
     std::uint32_t initial_inverse_bits = 0;
     unsigned high_mantissa = 0;
     int start_shift = 0;
+    int divisor_exponent = 0;
+    int working_exponent = 0;
+    int final_exponent_shift = 0;
+    bool exponent_stationary = false;
+};
+
+struct EvaluationMetadata {
+    int stage_index = -1;
+    int exact_residual_exponent = std::numeric_limits<int>::min();
+    SubnormalPoint subnormal_point = SubnormalPoint::None;
+    bool negative_subnormal = false;
 };
 
 struct Record {
@@ -117,6 +178,12 @@ struct Record {
     std::uint32_t quotient_hat = 0;
     std::uint32_t quotient_exact = 0;
     std::uint64_t detail = 0;
+    int stage_index = -1;
+    int divisor_exponent = 0;
+    int exact_residual_exponent = std::numeric_limits<int>::min();
+    SubnormalPoint subnormal_point = SubnormalPoint::None;
+    ValueClass final_exact_class = ValueClass::Zero;
+    bool negative_subnormal = false;
 };
 
 struct Evaluation {
@@ -126,6 +193,12 @@ struct Evaluation {
 
 struct ThreadResult {
     std::array<std::uint64_t, static_cast<std::size_t>(Outcome::Count)> counts{};
+    std::array<std::uint64_t, static_cast<std::size_t>(SubnormalPoint::Count)> subnormal_point_counts{};
+    std::array<
+        std::array<std::uint64_t, static_cast<std::size_t>(ValueClass::Count)>,
+        static_cast<std::size_t>(SubnormalPoint::Count)>
+        subnormal_final_class_counts{};
+    std::uint64_t negative_subnormal_count = 0;
     std::vector<Record> failures;
     std::vector<Record> exclusions;
 };
@@ -154,6 +227,8 @@ void print_usage(const char* argv0) {
               << "  --dump-exclusions PATH    write domain exclusions as TSV\n"
               << "  --max-records N           maximum records per output (default 64)\n"
               << "  --prehalve-max-exponent   test exact a/2 reduction for exponent-127 inputs\n"
+              << "  --exponent-stationary     keep the divisor at a constant normalized exponent\n"
+              << "  --working-exponent N      normalized divisor exponent (default 111)\n"
               << "  --stop-on-failure         stop after a proof/final failure\n";
 }
 
@@ -197,6 +272,10 @@ Options parse_options(int argc, char** argv) {
             options.stop_on_failure = true;
         } else if (argument == "--prehalve-max-exponent") {
             options.prehalve_max_exponent = true;
+        } else if (argument == "--exponent-stationary") {
+            options.exponent_stationary = true;
+        } else if (argument == "--working-exponent") {
+            options.working_exponent = static_cast<int>(std::stoll(require_value()));
         } else if (argument == "--help" || argument == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -213,6 +292,12 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.input_begin > options.input_end || options.input_end > 0x80000000ull) {
         throw std::invalid_argument("invalid positive input range");
+    }
+    if (options.working_exponent < -126 || options.working_exponent > 111) {
+        throw std::invalid_argument("working exponent must be in [-126, 111]");
+    }
+    if (options.exponent_stationary && options.working_exponent != kDefaultWorkingExponent) {
+        throw std::invalid_argument("the current exponent-stationary proof requires working exponent 111");
     }
     return options;
 }
@@ -304,6 +389,110 @@ std::optional<std::uint32_t> compose_exact_bits(std::uint64_t significand, int u
     return static_cast<std::uint32_t>(subnormal);
 }
 
+std::uint64_t round_shift_right_even(std::uint64_t value, unsigned shift) {
+    if (shift == 0) {
+        return value;
+    }
+    if (shift > 64) {
+        return 0;
+    }
+    if (shift == 64) {
+        return value > (std::uint64_t{1} << 63) ? 1 : 0;
+    }
+
+    const std::uint64_t truncated = value >> shift;
+    const std::uint64_t remainder = value & ((std::uint64_t{1} << shift) - 1);
+    const std::uint64_t halfway = std::uint64_t{1} << (shift - 1);
+    return truncated +
+           static_cast<std::uint64_t>(remainder > halfway || (remainder == halfway && (truncated & 1u) != 0));
+}
+
+std::optional<std::uint32_t> compose_rne_bits(std::uint64_t significand, int unit_exponent, bool sign = false) {
+    const std::uint32_t sign_bits = sign ? 0x80000000u : 0u;
+    if (significand == 0) {
+        return sign_bits;
+    }
+
+    int top_exponent = unit_exponent + floor_log2(significand);
+    if (top_exponent > 127) {
+        return std::nullopt;
+    }
+    if (top_exponent >= -126) {
+        const int precision_shift = floor_log2(significand) - 23;
+        std::uint64_t normalized = precision_shift > 0
+                                       ? round_shift_right_even(significand, static_cast<unsigned>(precision_shift))
+                                       : significand << -precision_shift;
+        if (normalized == 0x01000000ull) {
+            normalized >>= 1;
+            ++top_exponent;
+            if (top_exponent > 127) {
+                return std::nullopt;
+            }
+        }
+        return sign_bits | (static_cast<std::uint32_t>(top_exponent + 127) << 23) |
+               (static_cast<std::uint32_t>(normalized) & kMantissaMask);
+    }
+
+    const int subnormal_shift = unit_exponent + 149;
+    const std::uint64_t subnormal = subnormal_shift >= 0
+                                        ? significand << subnormal_shift
+                                        : round_shift_right_even(significand, static_cast<unsigned>(-subnormal_shift));
+    if (subnormal >= 0x00800000ull) {
+        return sign_bits | kPositiveNormalBegin;
+    }
+    return sign_bits | static_cast<std::uint32_t>(subnormal);
+}
+
+std::optional<std::uint32_t> pack_scaled_fp32_exact(
+    std::uint32_t normalized_value_bits, int physical_exponent_shift, bool sign = false) {
+    if (normalized_value_bits == 0) {
+        return sign ? 0x80000000u : 0u;
+    }
+    const FloatParts normalized = decode_float(normalized_value_bits);
+    if (!normalized.normal) {
+        return std::nullopt;
+    }
+    return compose_rne_bits(normalized.significand, normalized.unit_exponent + physical_exponent_shift, sign);
+}
+
+ValueClass classify_bits(std::uint32_t bits) {
+    const std::uint32_t magnitude_bits = bits & 0x7fffffffu;
+    const std::uint32_t biased = (magnitude_bits >> 23) & 0xffu;
+    if (biased == 0) {
+        return magnitude_bits == 0 ? ValueClass::Zero : ValueClass::Subnormal;
+    }
+    return biased == 0xffu ? ValueClass::Special : ValueClass::Normal;
+}
+
+void validate_exact_packer() {
+    struct PackCase {
+        std::uint32_t normalized_bits;
+        int exponent_shift;
+        bool sign;
+        std::optional<std::uint32_t> expected_bits;
+    };
+    constexpr std::array<PackCase, 8> cases = {{
+        {0x00000000u, 0, false, 0x00000000u},
+        {0x00000000u, 0, true, 0x80000000u},
+        {0x3f800000u, 0, false, 0x3f800000u},
+        {0x3f800000u, -149, false, 0x00000001u},
+        // Halfway between the largest subnormal and the smallest normal;
+        // ties-to-even must carry into the smallest normal.
+        {0x3fffffffu, -127, false, 0x00800000u},
+        // A halfway case whose truncated subnormal is already even.
+        {0x3ffffffdu, -127, false, 0x007ffffeu},
+        {0x3fffffffu, -128, false, 0x00400000u},
+        {0x3f800000u, 128, false, std::nullopt},
+    }};
+
+    for (const PackCase& pack_case : cases) {
+        const auto actual = pack_scaled_fp32_exact(pack_case.normalized_bits, pack_case.exponent_shift, pack_case.sign);
+        if (actual != pack_case.expected_bits) {
+            throw std::logic_error("exact FP32 packer self-test failed");
+        }
+    }
+}
+
 std::optional<std::uint32_t> exact_mod_bits(std::uint32_t input_bits, std::uint32_t divisor_bits) {
     if (input_bits == 0) {
         return 0u;
@@ -345,13 +534,7 @@ std::uint32_t nearest_away_uint16(std::uint32_t positive_float_bits) {
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(rounded, 65535));
 }
 
-std::optional<Config> make_config(std::uint32_t divisor_bits) {
-    if (!is_positive_normal(divisor_bits)) {
-        return std::nullopt;
-    }
-    const FloatParts divisor_parts = decode_float(divisor_bits);
-    const int start_shift = std::max(kInitialDivisorExponent - divisor_parts.unbiased_exponent, 0);
-
+std::optional<std::uint32_t> make_biased_reciprocal(std::uint32_t divisor_bits) {
     const float divisor = std::bit_cast<float>(divisor_bits);
     float reciprocal = 1.0f / divisor;
     if ((divisor_bits & kMantissaMask) != 0) {
@@ -362,17 +545,54 @@ std::optional<Config> make_config(std::uint32_t divisor_bits) {
     if (!is_positive_normal(reciprocal_bits)) {
         return std::nullopt;
     }
-    const auto initial_inverse = scale_normal_bits(reciprocal_bits, -start_shift);
-    if (!initial_inverse) {
+    return reciprocal_bits;
+}
+
+std::optional<Config> make_config(std::uint32_t divisor_bits, bool exponent_stationary, int working_exponent) {
+    if (!is_positive_normal(divisor_bits)) {
         return std::nullopt;
     }
+    const FloatParts divisor_parts = decode_float(divisor_bits);
 
     Config config;
     config.divisor_bits = divisor_bits;
-    config.reciprocal_up_bits = reciprocal_bits;
-    config.initial_inverse_bits = *initial_inverse;
+    config.divisor_exponent = divisor_parts.unbiased_exponent;
+    config.working_exponent = working_exponent;
+    config.exponent_stationary = exponent_stationary;
     config.high_mantissa = ((divisor_bits & kMantissaMask) & ~0xfffu) >> 11;
-    config.start_shift = start_shift;
+
+    if (exponent_stationary) {
+        config.start_shift = std::max(working_exponent - divisor_parts.unbiased_exponent, 0);
+        config.final_exponent_shift = divisor_parts.unbiased_exponent - working_exponent;
+        const auto normalized_divisor =
+            scale_normal_bits(divisor_bits, working_exponent - divisor_parts.unbiased_exponent);
+        if (!normalized_divisor) {
+            return std::nullopt;
+        }
+        const auto reciprocal = make_biased_reciprocal(*normalized_divisor);
+        if (!reciprocal) {
+            return std::nullopt;
+        }
+        config.reduction_divisor_bits = *normalized_divisor;
+        config.reciprocal_up_bits = *reciprocal;
+        config.initial_inverse_bits = *reciprocal;
+        return config;
+    }
+
+    config.start_shift = std::max(kInitialDivisorExponent - divisor_parts.unbiased_exponent, 0);
+    config.final_exponent_shift = 0;
+    const auto reciprocal = make_biased_reciprocal(divisor_bits);
+    if (!reciprocal) {
+        return std::nullopt;
+    }
+    const auto initial_inverse = scale_normal_bits(*reciprocal, -config.start_shift);
+    const auto reduction_divisor = scale_normal_bits(divisor_bits, config.start_shift);
+    if (!initial_inverse || !reduction_divisor) {
+        return std::nullopt;
+    }
+    config.reduction_divisor_bits = *reduction_divisor;
+    config.reciprocal_up_bits = *reciprocal;
+    config.initial_inverse_bits = *initial_inverse;
     return config;
 }
 
@@ -398,20 +618,25 @@ Evaluation make_evaluation(
     int shift = -1,
     std::uint32_t quotient_hat = 0,
     std::uint32_t quotient_exact = 0,
-    std::uint64_t detail = 0) {
+    std::uint64_t detail = 0,
+    EvaluationMetadata metadata = {}) {
     Evaluation evaluation;
     evaluation.outcome = outcome;
-    evaluation.record = {
-        outcome,
-        input_bits,
-        config.divisor_bits,
-        got_bits,
-        expected_bits,
-        shift,
-        quotient_hat,
-        quotient_exact,
-        detail,
-    };
+    evaluation.record.outcome = outcome;
+    evaluation.record.input_bits = input_bits;
+    evaluation.record.divisor_bits = config.divisor_bits;
+    evaluation.record.got_bits = got_bits;
+    evaluation.record.expected_bits = expected_bits;
+    evaluation.record.stage_shift = shift;
+    evaluation.record.quotient_hat = quotient_hat;
+    evaluation.record.quotient_exact = quotient_exact;
+    evaluation.record.detail = detail;
+    evaluation.record.stage_index = metadata.stage_index;
+    evaluation.record.divisor_exponent = config.divisor_exponent;
+    evaluation.record.exact_residual_exponent = metadata.exact_residual_exponent;
+    evaluation.record.subnormal_point = metadata.subnormal_point;
+    evaluation.record.final_exact_class = classify_bits(expected_bits);
+    evaluation.record.negative_subnormal = metadata.negative_subnormal;
     return evaluation;
 }
 
@@ -428,14 +653,16 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
         return make_evaluation(Outcome::InputSubnormal, config, input_bits, input_bits, expected_bits);
     }
 
-    auto divisor_bits = scale_normal_bits(config.divisor_bits, config.start_shift);
-    if (!divisor_bits) {
-        return make_evaluation(Outcome::ScaledDivisorNotNormal, config, input_bits, 0, expected_bits);
+    if (config.exponent_stationary && input_bits < config.divisor_bits) {
+        return make_evaluation(Outcome::Passed, config, input_bits, input_bits, expected_bits);
     }
+
+    std::optional<std::uint32_t> divisor_bits = config.reduction_divisor_bits;
     std::uint32_t inverse_bits = config.initial_inverse_bits;
     std::uint32_t residual_bits = input_bits;
     bool prehalved = false;
-    if (prehalve_max_exponent && input_bits != 0 && decode_float(input_bits).unbiased_exponent == 127) {
+    const bool use_prehalve = config.exponent_stationary || prehalve_max_exponent;
+    if (use_prehalve && input_bits != 0 && decode_float(input_bits).unbiased_exponent == 127) {
         const auto half_input = scale_normal_bits(input_bits, -1);
         if (!half_input) {
             return make_evaluation(Outcome::InternalInvariant, config, input_bits, 0, expected_bits);
@@ -443,7 +670,27 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
         residual_bits = *half_input;
         prehalved = true;
     }
+
+    if (config.exponent_stationary && config.divisor_exponent > config.working_exponent && residual_bits != 0) {
+        const auto normalized_input =
+            scale_normal_bits(residual_bits, config.working_exponent - config.divisor_exponent);
+        if (!normalized_input) {
+            return make_evaluation(
+                Outcome::IntermediateSubnormal,
+                config,
+                input_bits,
+                residual_bits,
+                expected_bits,
+                config.start_shift,
+                0,
+                0,
+                residual_bits,
+                {.subnormal_point = SubnormalPoint::InitialScaling});
+        }
+        residual_bits = *normalized_input;
+    }
     int shift = config.start_shift;
+    int stage_index = 0;
 
     while (true) {
         if (!is_positive_normal(*divisor_bits)) {
@@ -460,6 +707,7 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
             const float scaled_quotient = residual * inverse;
             const std::uint32_t scaled_quotient_bits = std::bit_cast<std::uint32_t>(scaled_quotient);
             if (!is_positive_normal(scaled_quotient_bits)) {
+                const ValueClass quotient_class = classify_bits(scaled_quotient_bits);
                 return make_evaluation(
                     Outcome::ScaledQuotientNotNormal,
                     config,
@@ -469,7 +717,12 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                     shift,
                     0,
                     0,
-                    scaled_quotient_bits);
+                    scaled_quotient_bits,
+                    {
+                        .stage_index = stage_index,
+                        .subnormal_point = quotient_class == ValueClass::Subnormal ? SubnormalPoint::QuotientProduct
+                                                                                   : SubnormalPoint::None,
+                    });
             }
 
             const std::uint32_t quotient_hat = nearest_away_uint16(scaled_quotient_bits);
@@ -523,7 +776,8 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                 divisor_parts.significand & ~0xfffu,
                 divisor_parts.significand & 0xfffu,
             };
-            for (const std::uint32_t component : components) {
+            for (std::size_t component_index = 0; component_index < components.size(); ++component_index) {
+                const std::uint32_t component = components[component_index];
                 if (component == 0) {
                     continue;
                 }
@@ -538,7 +792,13 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                         shift,
                         quotient_hat,
                         quotient_exact,
-                        component);
+                        component,
+                        {
+                            .stage_index = stage_index,
+                            .exact_residual_exponent = component_exponent,
+                            .subnormal_point =
+                                component_index == 0 ? SubnormalPoint::DivisorHigh : SubnormalPoint::DivisorLow,
+                        });
                 }
                 const std::uint64_t product = static_cast<std::uint64_t>(quotient_hat) * component;
                 if (precision_span(product) > 28) {
@@ -553,17 +813,42 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                         quotient_exact,
                         product);
                 }
-                if (product != 0 && divisor_parts.unit_exponent + floor_log2(product) >= 128) {
-                    return make_evaluation(
-                        Outcome::PartialProductOverflow,
-                        config,
-                        input_bits,
-                        residual_bits,
-                        expected_bits,
-                        shift,
-                        quotient_hat,
-                        quotient_exact,
-                        product);
+                if (product != 0) {
+                    const int product_exponent = divisor_parts.unit_exponent + floor_log2(product);
+                    if (product_exponent < -126) {
+                        return make_evaluation(
+                            Outcome::IntermediateSubnormal,
+                            config,
+                            input_bits,
+                            residual_bits,
+                            expected_bits,
+                            shift,
+                            quotient_hat,
+                            quotient_exact,
+                            product,
+                            {
+                                .stage_index = stage_index,
+                                .exact_residual_exponent = product_exponent,
+                                .subnormal_point =
+                                    component_index == 0 ? SubnormalPoint::HighProduct : SubnormalPoint::LowProduct,
+                            });
+                    }
+                    if (product_exponent >= 128) {
+                        return make_evaluation(
+                            Outcome::PartialProductOverflow,
+                            config,
+                            input_bits,
+                            residual_bits,
+                            expected_bits,
+                            shift,
+                            quotient_hat,
+                            quotient_exact,
+                            product,
+                            {
+                                .stage_index = stage_index,
+                                .exact_residual_exponent = product_exponent,
+                            });
+                    }
                 }
 
                 transient -= static_cast<std::int64_t>(product);
@@ -592,7 +877,14 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                             shift,
                             quotient_hat,
                             quotient_exact,
-                            transient_magnitude);
+                            transient_magnitude,
+                            {
+                                .stage_index = stage_index,
+                                .exact_residual_exponent = transient_exponent,
+                                .subnormal_point = component_index == 0 ? SubnormalPoint::AfterHighSubtract
+                                                                        : SubnormalPoint::AfterLowSubtract,
+                                .negative_subnormal = transient < 0,
+                            });
                     }
                     if (transient_exponent > 127) {
                         return make_evaluation(
@@ -611,6 +903,28 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
 
             if (quotient_error == 1) {
                 transient += divisor_parts.significand;
+                const std::uint64_t corrected_magnitude = magnitude(transient);
+                if (corrected_magnitude != 0) {
+                    const int corrected_exponent = divisor_parts.unit_exponent + floor_log2(corrected_magnitude);
+                    if (corrected_exponent < -126) {
+                        return make_evaluation(
+                            Outcome::IntermediateSubnormal,
+                            config,
+                            input_bits,
+                            residual_bits,
+                            expected_bits,
+                            shift,
+                            quotient_hat,
+                            quotient_exact,
+                            corrected_magnitude,
+                            {
+                                .stage_index = stage_index,
+                                .exact_residual_exponent = corrected_exponent,
+                                .subnormal_point = SubnormalPoint::AfterCorrection,
+                                .negative_subnormal = transient < 0,
+                            });
+                    }
+                }
             }
             if (transient < 0 || static_cast<std::uint64_t>(transient) != exact_remainder) {
                 return make_evaluation(
@@ -636,7 +950,13 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
                     shift,
                     quotient_hat,
                     quotient_exact,
-                    exact_remainder);
+                    exact_remainder,
+                    {
+                        .stage_index = stage_index,
+                        .exact_residual_exponent = divisor_parts.unit_exponent + floor_log2(exact_remainder),
+                        .subnormal_point =
+                            quotient_error == 1 ? SubnormalPoint::AfterCorrection : SubnormalPoint::AfterLowSubtract,
+                    });
             }
             if (*next_residual != 0 && *next_residual < kPositiveNormalBegin) {
                 return make_evaluation(
@@ -658,16 +978,40 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
         }
         const int decrement = std::min(kChunkStep, shift);
         shift -= decrement;
-        divisor_bits = scale_normal_bits(*divisor_bits, -decrement);
-        const auto next_inverse = scale_normal_bits(inverse_bits, decrement);
-        if (!divisor_bits) {
-            return make_evaluation(
-                Outcome::ScaledDivisorNotNormal, config, input_bits, residual_bits, expected_bits, shift);
+        if (config.exponent_stationary) {
+            if (residual_bits != 0) {
+                const auto next_residual = scale_normal_bits(residual_bits, decrement);
+                if (!next_residual) {
+                    return make_evaluation(
+                        Outcome::IntermediateOverflow,
+                        config,
+                        input_bits,
+                        residual_bits,
+                        expected_bits,
+                        shift,
+                        0,
+                        0,
+                        residual_bits,
+                        {
+                            .stage_index = stage_index,
+                        });
+                }
+                residual_bits = *next_residual;
+            }
+        } else {
+            divisor_bits = scale_normal_bits(*divisor_bits, -decrement);
+            const auto next_inverse = scale_normal_bits(inverse_bits, decrement);
+            if (!divisor_bits) {
+                return make_evaluation(
+                    Outcome::ScaledDivisorNotNormal, config, input_bits, residual_bits, expected_bits, shift);
+            }
+            if (!next_inverse) {
+                return make_evaluation(
+                    Outcome::InverseNotNormal, config, input_bits, residual_bits, expected_bits, shift);
+            }
+            inverse_bits = *next_inverse;
         }
-        if (!next_inverse) {
-            return make_evaluation(Outcome::InverseNotNormal, config, input_bits, residual_bits, expected_bits, shift);
-        }
-        inverse_bits = *next_inverse;
+        ++stage_index;
     }
 
     if (prehalved && residual_bits != 0) {
@@ -676,22 +1020,53 @@ Evaluation evaluate(std::uint32_t input_bits, const Config& config, bool prehalv
             return make_evaluation(Outcome::PostReductionOverflow, config, input_bits, residual_bits, expected_bits);
         }
         residual_bits = *doubled;
-        if (residual_bits >= config.divisor_bits) {
-            const auto corrected = exact_mod_bits(residual_bits, config.divisor_bits);
+        const std::uint32_t reconstruction_divisor_bits =
+            config.exponent_stationary ? config.reduction_divisor_bits : config.divisor_bits;
+        if (residual_bits >= reconstruction_divisor_bits) {
+            const auto corrected = exact_mod_bits(residual_bits, reconstruction_divisor_bits);
             if (!corrected) {
                 return make_evaluation(Outcome::InternalInvariant, config, input_bits, residual_bits, expected_bits);
             }
             if (*corrected != 0 && *corrected < kPositiveNormalBegin) {
-                return make_evaluation(Outcome::ExactRemainderSubnormal, config, input_bits, *corrected, expected_bits);
+                return make_evaluation(
+                    Outcome::ExactRemainderSubnormal,
+                    config,
+                    input_bits,
+                    *corrected,
+                    expected_bits,
+                    0,
+                    0,
+                    0,
+                    *corrected,
+                    {
+                        .stage_index = stage_index,
+                        .exact_residual_exponent = -149 + floor_log2(*corrected),
+                        .subnormal_point = SubnormalPoint::AfterCorrection,
+                    });
             }
             residual_bits = *corrected;
         }
     }
 
+    if (config.exponent_stationary) {
+        const auto packed = pack_scaled_fp32_exact(residual_bits, config.final_exponent_shift);
+        if (!packed) {
+            return make_evaluation(Outcome::PostReductionOverflow, config, input_bits, residual_bits, expected_bits);
+        }
+        residual_bits = *packed;
+    }
+
     if (residual_bits != expected_bits) {
         return make_evaluation(Outcome::FinalMismatch, config, input_bits, residual_bits, expected_bits);
     }
-    return make_evaluation(Outcome::Passed, config, input_bits, residual_bits, expected_bits);
+    EvaluationMetadata final_metadata;
+    if (config.exponent_stationary && classify_bits(expected_bits) == ValueClass::Subnormal) {
+        final_metadata.stage_index = stage_index;
+        final_metadata.exact_residual_exponent = -149 + floor_log2(expected_bits);
+        final_metadata.subnormal_point = SubnormalPoint::FinalResult;
+    }
+    return make_evaluation(
+        Outcome::Passed, config, input_bits, residual_bits, expected_bits, -1, 0, 0, 0, final_metadata);
 }
 
 void write_records(const std::string& path, const std::vector<Record>& records) {
@@ -702,14 +1077,20 @@ void write_records(const std::string& path, const std::vector<Record>& records) 
     if (!output) {
         throw std::runtime_error("cannot open record output: " + path);
     }
-    output << "outcome\tinput_bits\tdivisor_bits\tgot_bits\texpected_bits\tstage_shift\tq_hat\tq_exact\tdetail\n";
+    output << "outcome\tinput_bits\tdivisor_bits\tgot_bits\texpected_bits\tstage_index\tstage_shift\t"
+              "divisor_exponent\texact_residual_exponent\tq_hat\tq_exact\tq_error\tsubnormal_point\t"
+              "final_exact_class\tnegative_subnormal\tdetail\n";
     output << std::setfill('0');
     for (const Record& record : records) {
         output << std::hex << kOutcomeNames[static_cast<std::size_t>(record.outcome)] << "\t0x" << std::setw(8)
                << record.input_bits << "\t0x" << std::setw(8) << record.divisor_bits << "\t0x" << std::setw(8)
                << record.got_bits << "\t0x" << std::setw(8) << record.expected_bits << std::dec << '\t'
-               << record.stage_shift << '\t' << record.quotient_hat << '\t' << record.quotient_exact << std::hex
-               << "\t0x" << record.detail << std::dec << '\n';
+               << record.stage_index << '\t' << record.stage_shift << '\t' << record.divisor_exponent << '\t'
+               << record.exact_residual_exponent << '\t' << record.quotient_hat << '\t' << record.quotient_exact << '\t'
+               << static_cast<std::int64_t>(record.quotient_hat) - record.quotient_exact << '\t'
+               << kSubnormalPointNames[static_cast<std::size_t>(record.subnormal_point)] << '\t'
+               << kValueClassNames[static_cast<std::size_t>(record.final_exact_class)] << '\t'
+               << record.negative_subnormal << std::hex << "\t0x" << record.detail << std::dec << '\n';
     }
 }
 
@@ -717,10 +1098,12 @@ void write_records(const std::string& path, const std::vector<Record>& records) 
 
 int main(int argc, char** argv) {
     try {
+        validate_exact_packer();
         const Options options = parse_options(argc, argv);
-        const auto config_optional = make_config(options.divisor_bits);
+        const auto config_optional =
+            make_config(options.divisor_bits, options.exponent_stationary, options.working_exponent);
         if (!config_optional) {
-            std::cerr << "configuration_outcome DivisorOrReciprocalNotNormal\n";
+            std::cerr << "configuration_outcome DivisorOrNormalizedReciprocalNotNormal\n";
             return 2;
         }
         const Config config = *config_optional;
@@ -735,10 +1118,14 @@ int main(int argc, char** argv) {
         std::cout << std::hex << std::setfill('0') << "divisor_bits 0x" << std::setw(8) << config.divisor_bits
                   << "\nreciprocal_up_bits 0x" << std::setw(8) << config.reciprocal_up_bits
                   << "\ninitial_inverse_bits 0x" << std::setw(8) << config.initial_inverse_bits << std::dec
-                  << "\nstart_shift " << config.start_shift << "\nhigh_mantissa " << config.high_mantissa
+                  << "\nreduction_divisor_bits 0x" << std::hex << std::setw(8) << config.reduction_divisor_bits
+                  << std::dec << "\nstart_shift " << config.start_shift << "\nhigh_mantissa " << config.high_mantissa
+                  << "\nexponent_stationary " << config.exponent_stationary << "\nworking_exponent "
+                  << config.working_exponent << "\nfinal_exponent_shift " << config.final_exponent_shift
                   << "\nrange_begin 0x" << std::hex << shard_begin << "\nrange_end 0x" << shard_end << std::dec
                   << "\nshard " << options.shard << '/' << options.num_shards << "\nthreads " << worker_count
-                  << "\nprehalve_max_exponent " << options.prehalve_max_exponent << '\n';
+                  << "\nprehalve_max_exponent " << (options.prehalve_max_exponent || options.exponent_stationary)
+                  << '\n';
 
         std::atomic<bool> stop = false;
         std::vector<ThreadResult> results(worker_count);
@@ -757,6 +1144,13 @@ int main(int argc, char** argv) {
                     const Evaluation evaluation =
                         evaluate(static_cast<std::uint32_t>(value), config, options.prehalve_max_exponent);
                     ++result.counts[static_cast<std::size_t>(evaluation.outcome)];
+                    if (evaluation.record.subnormal_point != SubnormalPoint::None) {
+                        const std::size_t point_index = static_cast<std::size_t>(evaluation.record.subnormal_point);
+                        const std::size_t class_index = static_cast<std::size_t>(evaluation.record.final_exact_class);
+                        ++result.subnormal_point_counts[point_index];
+                        ++result.subnormal_final_class_counts[point_index][class_index];
+                        result.negative_subnormal_count += evaluation.record.negative_subnormal;
+                    }
                     if (evaluation.outcome != Outcome::Passed) {
                         std::vector<Record>& records =
                             is_failure(evaluation.outcome) ? result.failures : result.exclusions;
@@ -775,12 +1169,27 @@ int main(int argc, char** argv) {
         }
 
         std::array<std::uint64_t, static_cast<std::size_t>(Outcome::Count)> counts{};
+        std::array<std::uint64_t, static_cast<std::size_t>(SubnormalPoint::Count)> subnormal_point_counts{};
+        std::array<
+            std::array<std::uint64_t, static_cast<std::size_t>(ValueClass::Count)>,
+            static_cast<std::size_t>(SubnormalPoint::Count)>
+            subnormal_final_class_counts{};
+        std::uint64_t negative_subnormal_count = 0;
         std::vector<Record> failures;
         std::vector<Record> exclusions;
         for (const ThreadResult& result : results) {
             for (std::size_t index = 0; index < counts.size(); ++index) {
                 counts[index] += result.counts[index];
             }
+            for (std::size_t point = 0; point < subnormal_point_counts.size(); ++point) {
+                subnormal_point_counts[point] += result.subnormal_point_counts[point];
+                for (std::size_t value_class = 0; value_class < static_cast<std::size_t>(ValueClass::Count);
+                     ++value_class) {
+                    subnormal_final_class_counts[point][value_class] +=
+                        result.subnormal_final_class_counts[point][value_class];
+                }
+            }
+            negative_subnormal_count += result.negative_subnormal_count;
             failures.insert(failures.end(), result.failures.begin(), result.failures.end());
             exclusions.insert(exclusions.end(), result.exclusions.begin(), result.exclusions.end());
         }
@@ -801,6 +1210,24 @@ int main(int argc, char** argv) {
             if (is_failure(static_cast<Outcome>(index))) {
                 failure_count += counts[index];
             }
+        }
+        for (std::size_t point = 1; point < subnormal_point_counts.size(); ++point) {
+            if (subnormal_point_counts[point] == 0) {
+                continue;
+            }
+            std::cout << "subnormal_point " << kSubnormalPointNames[point] << ' ' << subnormal_point_counts[point]
+                      << '\n';
+            for (std::size_t value_class = 0; value_class < static_cast<std::size_t>(ValueClass::Count);
+                 ++value_class) {
+                if (subnormal_final_class_counts[point][value_class] != 0) {
+                    std::cout << "subnormal_final_class " << kSubnormalPointNames[point] << ' '
+                              << kValueClassNames[value_class] << ' '
+                              << subnormal_final_class_counts[point][value_class] << '\n';
+                }
+            }
+        }
+        if (negative_subnormal_count != 0) {
+            std::cout << "negative_subnormal_before_correction " << negative_subnormal_count << '\n';
         }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         std::cout << "processed " << processed << "\nfailures " << failure_count << "\nelapsed_seconds " << elapsed
