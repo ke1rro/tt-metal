@@ -10,7 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `51aa60f3cf` (`research: validate exponent-stationary scalar modulo model`)
+- HEAD: `94ed31d5e7` (`research: characterize scalar modulo raw-pack transport`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -23,10 +23,13 @@ well as verified results.
 - The four production headers in HEAD retain the old ten-block correction
   behavior and only cache `scaled = v * recip_val`. Current uncommitted work does
   not modify production headers.
-- Current uncommitted work adds a test-only SFPU raw-pack transport probe, its
-  report, and this handoff update. Blackhole preserves subnormal FP32 encodings
-  through the raw path; Wormhole flushes them to signed zero even through the
-  tested opaque-32 store and UInt32 pack path.
+- Commit `94ed31d5e7` is the isolated raw-pack transport milestone. Blackhole
+  preserves subnormal FP32 encodings through that path; Wormhole's passing
+  architecture contract expects signed-zero FTZ through the tested opaque-32
+  store and UInt32 pack path.
+- Current uncommitted work adds the test-only Blackhole exponent-stationary
+  normalized reducer, its exact raw-bit silicon test, and its device report.
+  It does not change production headers or implement sign/final packing.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -59,12 +62,14 @@ The original design brief and the latest review are in:
 /home/user/.codex/attachments/2a8f6469-4af2-4a92-b90f-83ed323fc2ff/pasted-text.txt
 /home/user/.codex/attachments/1fb41107-fe79-4207-9382-2bfe7bea0024/pasted-text.txt
 /home/user/.codex/attachments/8912644b-b9b9-4ce6-be3b-a4df6bbf6a16/pasted-text.txt
+/home/user/.codex/attachments/1a714ba4-a7f6-4b4b-84ef-a20b00685b18/pasted-text.txt
 ```
 
 Do not integrate Architecture A into production: its host/device research is
 complete enough to reject it on compiler and performance grounds. The raw-pack
-milestone now has real Blackhole and Wormhole silicon evidence; the stationary
-reducer itself still has no device implementation or runtime result.
+milestone now has real Blackhole and Wormhole silicon evidence. The isolated
+stationary normalized reducer now also has Blackhole compile, silicon, and
+disassembly evidence; physical finalization remains separate.
 
 ## Production header state
 
@@ -755,13 +760,61 @@ kernel is therefore blocked. Wormhole reducer research may continue only with
 an explicit FTZ result contract or after a separately verified output mechanism
 is found.
 
+## Blackhole stationary normalized-reducer device gate
+
+Test-only files:
+
+```text
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_stationary_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_stationary_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_stationary.py
+docs/SFPI_SCALAR_MODULO_STATIONARY_DEVICE_RESEARCH.md
+```
+
+The isolated kernel implements only:
+
+```text
+abs(input)
+    -> exponent-127 pre-half
+    -> stationary D/rho/high/low stages at working exponent 111
+    -> (2R) mod D top reconstruction
+    -> normalized nonnegative FP32 R
+```
+
+There is no sign restoration or physical/raw finalizer. The exact raw-bit gate
+passes all 11 requested divisor families on Blackhole p150b:
+
+```text
+Blackhole compile  11/11 passed
+Blackhole silicon  11/11 passed
+```
+
+The matrix covers four `Eb=-126` mantissa/split boundaries, 3, FP32 0.1,
+`nextDown(8)`, 8, `nextUp(8)`, `2^112`, and `FLT_MAX`. It includes `a<b`,
+equality, exact multiples, one-lattice-step neighbors, local quotients 65534
+and 65535, ratios below 65536, both signs, and exponent-127 pre-half
+boundaries wherever representable. There are 11,264 device result comparisons
+from 299 designed signed patterns. The independent stage oracle checks 1,000
+active stages in the designed set, observes quotient errors `{0,+1}`, and
+rejects any `q_hat` outside `{q,q+1}`.
+
+All reducer symbols compile without a spill. One-stage forms are `0xa8` bytes;
+multi-stage forms are `0xf8` bytes. Only `L0-L4` are visible. Each symbol has
+the two expected input/reconstruction `sfpload` instructions, one output
+`sfpstore`, and no scalar-memory operations. The two `ttreplay` instructions in
+multi-stage forms replay the stationary stage; they are not spills.
+
+This closes the selected Blackhole normalized-arithmetic and register gate. It
+does not validate sign semantics, physical normal/subnormal packing,
+special/zero-divisor policy, stationary performance, Wormhole arithmetic, or a
+production operator.
+
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Prototype the normalized exponent-stationary magnitude reducer test-only,
-   but keep finalization outside it so arithmetic and transport are measured
-   independently.
+2. Keep the passing normalized exponent-stationary magnitude reducer isolated
+   from finalization; use it as the Blackhole arithmetic/register baseline.
 3. For Blackhole only, add the integer normal/subnormal finalizer, perform
    floor-remainder `D-R` sign adjustment before packing, preserve exact-zero
    sign, and add the high-divisor `a<b` bypass.
@@ -796,6 +849,7 @@ is found.
 - Keep special-value policy explicitly unresolved. Treat FTZ/subnormal behavior
   as measured only for the documented smallest-normal-divisor Blackhole probes;
   do not generalize it to all inputs or to Wormhole without hardware evidence.
-- Treat the exponent-stationary reducer result as host-only; the device result
-  validates transport behavior only, not stationary reduction correctness or
-  performance.
+- Treat the exponent-stationary all-normal-divisor proof as host evidence over
+  its documented sweep. Blackhole device evidence covers only the selected
+  normalized-reducer matrix above; performance and physical finalization are
+  still unvalidated.
