@@ -10,7 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `75855e3002` (`research: exhaustive fixed-schedule scalar modulo validation`)
+- HEAD: `51aa60f3cf` (`research: validate exponent-stationary scalar modulo model`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -23,9 +23,10 @@ well as verified results.
 - The four production headers in HEAD retain the old ten-block correction
   behavior and only cache `scaled = v * recip_val`. Current uncommitted work does
   not modify production headers.
-- Current uncommitted work adds a host-only exponent-stationary Architecture B
-  follow-up to the checkpointed fixed schedule. It changes only the two host
-  models and research documentation; production and SFPI headers are untouched.
+- Current uncommitted work adds a test-only SFPU raw-pack transport probe, its
+  report, and this handoff update. Blackhole preserves subnormal FP32 encodings
+  through the raw path; Wormhole flushes them to signed zero even through the
+  tested opaque-32 store and UInt32 pack path.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -57,11 +58,13 @@ The original design brief and the latest review are in:
 /home/user/.codex/attachments/0ee83c9d-fc3b-46f8-a611-3e7e63b697d4/pasted-text.txt
 /home/user/.codex/attachments/2a8f6469-4af2-4a92-b90f-83ed323fc2ff/pasted-text.txt
 /home/user/.codex/attachments/1fb41107-fe79-4207-9382-2bfe7bea0024/pasted-text.txt
+/home/user/.codex/attachments/8912644b-b9b9-4ce6-be3b-a4df6bbf6a16/pasted-text.txt
 ```
 
 Do not integrate Architecture A into production: its host/device research is
-complete enough to reject it on compiler and performance grounds. Wormhole
-runtime results must remain explicitly unknown on this Blackhole-only server.
+complete enough to reject it on compiler and performance grounds. The raw-pack
+milestone now has real Blackhole and Wormhole silicon evidence; the stationary
+reducer itself still has no device implementation or runtime result.
 
 ## Production header state
 
@@ -699,29 +702,84 @@ and 100,582 arbitrary-normal-divisor cases with zero exclusion and quotient
 error `[0,+1]`. See
 `docs/SFPI_SCALAR_MODULO_EXPONENT_STATIONARY_RESEARCH.md`.
 
-This is host evidence only. No exponent-stationary SFPI/device code or new
-performance measurement exists yet.
+This remains host evidence for the reducer. The separate device transport gate
+below does not validate stationary arithmetic or its register allocation.
+
+## Raw-pack transport device gate
+
+Test-only files:
+
+```text
+tt_metal/tt-llk/tests/sources/sfpu_raw_pack_transport_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_raw_pack_transport.py
+docs/SFPI_SCALAR_MODULO_RAW_PACK_TRANSPORT.md
+```
+
+The microkernel constructs FP32 bit patterns directly in SFPU LRegs, stores
+them to 32-bit Dst, packs to a UInt32 output buffer, and compares host uint32
+words. It includes signed zeros, 13 positive/negative subnormal patterns,
+min-normal boundaries, ordinary normals, and maximum finite values.
+
+Final compile and silicon runs passed on both architectures:
+
+```text
+Wormhole compile/silicon  2/2 passed
+Blackhole compile/silicon 2/2 passed
+```
+
+The passing contract is intentionally architecture-specific:
+
+- Blackhole `MOD0_FMT_INT32` (`4`) plus UInt32 pack preserves every tested word
+  exactly, including all subnormal encodings.
+- Wormhole `MOD0_FMT_INT32` flushes subnormal-looking encodings. A stronger
+  attempt using pre-rotated numeric `MOD0=9` opaque-32 store plus UInt32 pack
+  still flushes every subnormal encoding to the corresponding signed zero.
+- FP32 control stores flush only the subnormal encodings on both architectures.
+- Disabling packer zero-flag substitution did not change Wormhole output, so
+  that is not the observed conversion point.
+
+Disassembly confirms the final raw forms:
+
+```text
+Blackhole  sfpstore ...,0,4,7
+Wormhole   sfpstore ...,0,9,3
+```
+
+Wormhole also requires point-of-use `sfpconfig; sfpnop; sfpencc` after the
+32-bit unpack-to-Dst handshake; prelude-only initialization left stores
+ineffective. No production header was changed.
+
+Decision: the exact final-subnormal output gate is open for Blackhole and
+closed for Wormhole through all tested Dst/packer paths. A common exact robust
+kernel is therefore blocked. Wormhole reducer research may continue only with
+an explicit FTZ result contract or after a separately verified output mechanism
+is found.
 
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Implement the exponent-stationary reducer in a new test-only SFPI helper,
-   including raw normal/subnormal packing without spills or floating-store FTZ.
-3. Perform floor-remainder `D-R` sign adjustment before packing and preserve
-   exact-zero sign; add the high-divisor `a<b` bypass.
-4. Compile/disassemble Blackhole and Wormhole, then run Blackhole raw-bit FTZ,
+2. Prototype the normalized exponent-stationary magnitude reducer test-only,
+   but keep finalization outside it so arithmetic and transport are measured
+   independently.
+3. For Blackhole only, add the integer normal/subnormal finalizer, perform
+   floor-remainder `D-R` sign adjustment before packing, preserve exact-zero
+   sign, and add the high-divisor `a<b` bypass.
+4. For Wormhole, either approve an explicit FTZ result contract or first build
+   and gate a genuinely different transport such as split 16-bit output. Do not
+   present the current raw/UInt32 path as exact.
+5. Compile/disassemble both reducers, reject spills, and run raw-bit,
    top-range, correctness, register-pressure, and lane-mix performance tests.
-5. Define special-value, zero-divisor, signed-zero, subnormal-input, and FTZ
+6. Define special-value, zero-divisor, signed-zero, subnormal-input, and FTZ
    policy at the operator boundary.
-6. Review the two explicit Architecture B contracts with the TT/SFPI owner:
+7. Review the two explicit Architecture B contracts with the TT/SFPI owner:
    `FastBounded` selected only from proven range metadata, and fixed-schedule
    `Robust` as the generic path after its exclusions are closed.
-7. Obtain real Wormhole runtime correctness/performance and tune its dependency
-   schedule; current Wormhole evidence is compile/disassembly only.
-8. Make no production change until the robust proof domain and API/dispatch
-   contract are approved; then rerun host, raw-bit device, disassembly, register,
-   lane-mix, and TTNN validation.
+8. Obtain Wormhole reducer runtime correctness/performance and tune its
+   dependency schedule; current Wormhole runtime evidence covers transport only.
+9. Make no production change until the robust proof domain, per-architecture
+   output semantics, and API/dispatch contract are approved; then rerun host,
+   raw-bit device, disassembly, register, lane-mix, and TTNN validation.
 
 ## Safety and claim rules
 
@@ -733,10 +791,11 @@ performance measurement exists yet.
 - Blackhole chunked verification covers selected normal cases for divisors
   `3`, `5`, `7`, `10`, FP32 `0.1`, and FP32 `0.3`; do not generalize it to the
   full FP32/FTZ/special-value domain.
-- Do not claim Wormhole equivalence without Wormhole hardware or a saved
-  Wormhole reference.
+- Do not claim Wormhole exact subnormal output: real Wormhole hardware flushed
+  every tested subnormal encoding through both INT32 and opaque-32/UInt32 paths.
 - Keep special-value policy explicitly unresolved. Treat FTZ/subnormal behavior
   as measured only for the documented smallest-normal-divisor Blackhole probes;
   do not generalize it to all inputs or to Wormhole without hardware evidence.
-- Treat the exponent-stationary result as host-only; do not claim device
-  correctness or performance until the raw pack and reducer run on hardware.
+- Treat the exponent-stationary reducer result as host-only; the device result
+  validates transport behavior only, not stationary reduction correctness or
+  performance.
