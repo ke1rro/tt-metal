@@ -118,12 +118,17 @@ inline void calculate_scalar_modulo_hybrid()
         if constexpr (FLOOR_REMAINDER)
         {
             result = reduced;
-            v_if (value < 0.0f && reduced != 0.0f)
+            v_if (((value < 0.0f && scalar >= 0.0f) || (value >= 0.0f && scalar < 0.0f)) && reduced != 0.0f)
             {
                 result = divisor - reduced;
             }
             v_endif;
             result = sfpi::copysgn(result, scalar);
+            v_if (reduced == 0.0f)
+            {
+                result = sfpi::copysgn(reduced, value);
+            }
+            v_endif;
         }
         else
         {
@@ -135,13 +140,21 @@ inline void calculate_scalar_modulo_hybrid()
     }
 }
 
-// Diagnostic layout, one vector result per full-tile SFPU iteration:
-//   0..8: a, b, reciprocal, scaled, q_hat, pre-correction residual,
-//         safe predicate, fast residual, initial scaled divisor
-//   9..28: fallback residual after steps 0..19
-//   29: fallback residual after step 23
-//   30: final fallback magnitude
-//   31: final positive-divisor fmod result
+// Minimal diagnostic layout, one vector result per full-tile SFPU iteration:
+//   0: a
+//   1: b
+//   2: reciprocal
+//   3: scaled
+//   4: q_hat
+//   5: pre-correction residual
+//   6: residual after the positive correction
+//   7: residual after the negative correction
+//   8: safe predicate
+//   9..31: repeat the final corrected residual
+//
+// Compute each result in a separate scalar-control-flow arm. Keeping all of
+// the intermediate vectors and fallback checkpoints live at once exceeds the
+// SFPU local-register file and makes the compiler attempt an illegal spill.
 template <int ITERATIONS = 32>
 inline void calculate_scalar_modulo_diagnostic()
 {
@@ -151,63 +164,11 @@ inline void calculate_scalar_modulo_diagnostic()
 #pragma GCC unroll 0
     for (int iteration = 0; iteration < ITERATIONS; ++iteration)
     {
-        const sfpi::vFloat value           = sfpi::dst_reg[0];
-        const sfpi::vFloat magnitude       = sfpi::abs(value);
-        const sfpi::vFloat scaled          = magnitude * reciprocal;
-        const sfpi::vFloat quotient        = scalar_modulo_truncate_positive(scaled);
-        const sfpi::vFloat residual_before = magnitude - quotient * divisor;
-        const sfpi::vFloat fast_residual   = scalar_modulo_fast_magnitude(magnitude, divisor, quotient);
-
-        sfpi::vFloat safe = 0.0f;
-        v_if (sfpi::exexp(scaled) < 22)
-        {
-            safe = 1.0f;
-        }
-        v_endif;
-
-        sfpi::vFloat fallback       = magnitude;
-        sfpi::vInt remaining        = sfpi::exexp(magnitude) - sfpi::exexp(divisor);
-        sfpi::vFloat scaled_divisor = sfpi::setexp(divisor, sfpi::exexp(magnitude, sfpi::ExponentMode::Biased));
-        v_if (scaled_divisor > magnitude)
-        {
-            scaled_divisor = sfpi::addexp(scaled_divisor, -1);
-            remaining      = remaining - 1;
-        }
-        v_endif;
-        const sfpi::vFloat initial_scaled_divisor = scaled_divisor;
-        sfpi::vFloat checkpoint                   = fallback;
-
-        int selected_step = iteration - 9;
-        if (iteration == 29)
-        {
-            selected_step = 23;
-        }
-
-#pragma GCC unroll 0
-        for (int step = 0; step < 254; ++step)
-        {
-            v_if (remaining >= 0)
-            {
-                v_if (fallback >= scaled_divisor)
-                {
-                    fallback = fallback - scaled_divisor;
-                }
-                v_endif;
-                scaled_divisor = sfpi::addexp(scaled_divisor, -1);
-                remaining      = remaining - 1;
-            }
-            v_endif;
-
-            if (step == selected_step)
-            {
-                checkpoint = fallback;
-            }
-        }
-
-        sfpi::vFloat output = fallback;
+        const sfpi::vFloat value = sfpi::dst_reg[0];
+        sfpi::vFloat output;
         if (iteration == 0)
         {
-            output = magnitude;
+            output = sfpi::abs(value);
         }
         else if (iteration == 1)
         {
@@ -219,35 +180,43 @@ inline void calculate_scalar_modulo_diagnostic()
         }
         else if (iteration == 3)
         {
-            output = scaled;
+            output = sfpi::abs(value) * reciprocal;
         }
         else if (iteration == 4)
         {
-            output = quotient;
+            output = scalar_modulo_truncate_positive(sfpi::abs(value) * reciprocal);
         }
         else if (iteration == 5)
         {
-            output = residual_before;
+            const sfpi::vFloat magnitude = sfpi::abs(value);
+            const sfpi::vFloat quotient  = scalar_modulo_truncate_positive(magnitude * reciprocal);
+            output                       = magnitude - quotient * divisor;
         }
         else if (iteration == 6)
         {
-            output = safe;
-        }
-        else if (iteration == 7)
-        {
-            output = fast_residual;
+            const sfpi::vFloat magnitude = sfpi::abs(value);
+            const sfpi::vFloat quotient  = scalar_modulo_truncate_positive(magnitude * reciprocal);
+            output                       = magnitude - quotient * divisor;
+            v_if (output >= divisor)
+            {
+                output = output - divisor;
+            }
+            v_endif;
         }
         else if (iteration == 8)
         {
-            output = initial_scaled_divisor;
+            output = 0.0f;
+            v_if (sfpi::exexp(sfpi::abs(value) * reciprocal) < 22)
+            {
+                output = 1.0f;
+            }
+            v_endif;
         }
-        else if (iteration < 30)
+        else
         {
-            output = checkpoint;
-        }
-        else if (iteration == 31)
-        {
-            output = sfpi::copysgn(fallback, value);
+            const sfpi::vFloat magnitude = sfpi::abs(value);
+            const sfpi::vFloat quotient  = scalar_modulo_truncate_positive(magnitude * reciprocal);
+            output                       = scalar_modulo_fast_magnitude(magnitude, divisor, quotient);
         }
 
         sfpi::dst_reg[0] = output;

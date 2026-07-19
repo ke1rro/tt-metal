@@ -1,6 +1,6 @@
 # SFPI Scalar Modulo Research — Work State
 
-Last updated: 2026-07-18 UTC
+Last updated: 2026-07-19 UTC
 
 This file is a restart/handoff record for the scalar SFPI `fmod` and floor-style
 `remainder` optimization research. It intentionally records unfinished work as
@@ -10,45 +10,61 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `375862277bcb2b3ef89a2543b090f8dbf3eb49d7`
-- HEAD subject: `Optimize scalar SFPI fmod and remainder`
-- Tracking remote: `fork/opt/optimize-sfpi-scalar-modulo`
-- Fork: `git@github.com:ke1rro/tt-metal.git`
+- HEAD: `86ba7d8b5eafae2c2799065b94fea8f145b67522`
+- HEAD subject: `wip`
+- Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
+- Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
   - username: `ke1rro`
   - email: `nikitalenyk2@gmail.com`
-- No new commit or push was made after the correctness audit.
-- The remote branch and HEAD still contain the rejected two-correction
-  implementation. Do not present commit `375862277bc` as correctness-safe.
-- The local working tree changes production headers back to the old ten-block
-  correction behavior while retaining only cached `scaled = v * recip_val`.
-  This local rollback is uncommitted and unpushed.
+- Commit `86ba7d8b5e` is a pushed WIP checkpoint containing the reports, exact host
+  model, test-only hybrid prototype, and the production caching-only rollback.
+- Parent commit `375862277bc` contains the rejected unconditional two-correction
+  implementation. Do not present it as correctness-safe.
+- The four production headers in HEAD retain the old ten-block correction
+  behavior and only cache `scaled = v * recip_val`. Current uncommitted work does
+  not modify production headers.
+- Current uncommitted changes retain the earlier diagnostic/hybrid and
+  fixed-stage chunked Architecture A research, and add the Architecture B
+  scalar-fixed schedule: exact Python/C++ models, exhaustive sweeps, test-only
+  device prototypes, correctness/performance probes, disassembly analysis, and
+  reports. They do not modify production headers.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
+- `.agents/` is also untracked and unrelated. Preserve it.
 
 ## User goal
 
 Research, mathematically justify, prototype, validate, disassemble, and benchmark
-a correctness-preserving hybrid SFPI implementation:
+the Architecture A fixed-stage chunked hybrid first:
 
 ```text
 proven safe quotient range
     -> cached reciprocal product + truncation + two corrections
 
 unsafe/large quotient range
-    -> robust exponent-scaled range reduction
+    -> short fixed-stage chunked range reduction
 ```
 
-The full design brief is in:
+If Architecture A misses correctness, compiler, or performance gates, stop it
+and specify Architecture B as separate `FastBounded` and `Robust` compiled
+kernels without an automatic tensor scan. Architecture A missed the
+compiler/performance gates. Architecture B's robust scalar-specialized fixed
+schedule has now been prototyped and passes the weak Blackhole `<10k` gate on
+the exhaustively verified fixed-divisor normal domains documented below.
+
+The original design brief and the latest review are in:
 
 ```text
 /home/user/.codex/attachments/85cf7851-d51f-4d10-b3b0-adf43a363e57/pasted-text.txt
+/home/user/.codex/attachments/0ee83c9d-fc3b-46f8-a611-3e7e63b697d4/pasted-text.txt
+/home/user/.codex/attachments/2a8f6469-4af2-4a92-b90f-83ed323fc2ff/pasted-text.txt
+/home/user/.codex/attachments/1fb41107-fe79-4207-9382-2bfe7bea0024/pasted-text.txt
 ```
 
-Do not integrate the hybrid into production until classifier and fallback have
-passed exact host tests, Blackhole diagnostics, prototype correctness, and a
-performance assessment. Wormhole results must remain explicitly unknown on
-this Blackhole-only server.
+Do not integrate Architecture A into production: its host/device research is
+complete enough to reject it on compiler and performance grounds. Wormhole
+runtime results must remain explicitly unknown on this Blackhole-only server.
 
 ## Production header state
 
@@ -144,7 +160,7 @@ Exclusions still needing policy/device validation: NaN, infinity, reciprocal or
 product overflow, subnormal inputs/results, SFPU FTZ effects, and exact
 partially-fused residual bits.
 
-### Fallback conclusion
+### Fallback conclusions
 
 The leading candidate is radix-2 exponent-scaled reduction:
 
@@ -170,8 +186,23 @@ Rejected as standalone solutions:
 - naive repeated subtraction by small `b`;
 - the existing ten `b-r` blocks as a correctness proof.
 
-Radix-4 remains the next performance candidate. Radix-16 is expected to have
-high register/predicate cost and has not been validated.
+The subsequent fixed-stage chunked investigation found a proof-safe way to use
+16 quotient bits per stage, but its measured cost still rejects an
+always-present hybrid. The selected normal-domain candidate uses:
+
+- `CHUNK_BITS=16`, hence at most `ceil(253/15)=17` stages;
+- a two-ULP one-sided upper reciprocal;
+- a quotient estimate proven to be either exact or one too high;
+- a split divisor with two components of at most 12 significant bits each, so
+  every quotient-component product fits the SFPMAD 28-bit partial-fusion limit;
+- one negative correction per stage.
+
+This candidate is correctness-promising but not a production result. Its proof
+excludes FTZ/subnormal and special-value behavior, and its Blackhole performance
+misses the gate by a wide margin. Architecture A is therefore rejected. The
+recommended Architecture B is two explicit kernels/contracts—`FastBounded`
+when the caller proves the quotient bound and `Robust` otherwise—with no tensor
+scan and no always-present masked fallback.
 
 ## SIMD dispatch risk
 
@@ -213,6 +244,43 @@ divisors. The random run covers one million seeded normal FP32 dividends. This
 is not exhaustive over all FP32 pairs and does not model all SFPU special-value
 details.
 
+### Chunked exact-reference model
+
+File:
+
+```text
+tools/sfpi_modulo_chunked_reference.py
+```
+
+The model evaluates requested `CHUNK_BITS` values `8`, `12`, `16`, `18`, and
+`20`. For every non-excluded input it checks the one-sided quotient-estimate
+bound, component product width, correction count, exact stage invariant, and
+minimum exponent-gap progress. Each candidate completed:
+
+```text
+deterministic and boundary pairs       582
+positive finite BF16 pairs          357632
+seeded random normal FP32 pairs     1000000
+total non-excluded pairs            1349689
+failures                                  0
+```
+
+Candidate summary:
+
+| Chunk bits | Fixed stages | Max observed | Components | Min progress | Failures |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 37 | 18 | 2 x <=20 bits | 7 | 0 |
+| 12 | 23 | 12 | 2 x <=16 bits | 11 | 0 |
+| 16 | 17 | 9 | 2 x <=12 bits | 15 | 0 |
+| 18 | 15 | 8 | 3 x <=10 bits | 17 | 0 |
+| 20 | 14 | 7 | 3 x <=8 bits | 19 | 0 |
+
+`CHUNK_BITS=16` minimizes fixed component subtractions among these candidates:
+`74`, `46`, `34`, `45`, and `42`, respectively. Its full rerun reported 8,525
+excluded pairs; all were classified as exact-intermediate/result subnormal and
+therefore outside the current SFPU FTZ proof. Host verification is strong
+finite-normal evidence, not exhaustive FP32 or device proof.
+
 ## Existing Blackhole validation and performance
 
 Hardware detected on this server:
@@ -234,6 +302,8 @@ Blackhole MATH_ISOLATE cycles per tile:
 | Original baseline | 2976.242 | 3328.242 | incomplete old reducer |
 | Caching only | 2912.227 | 3264.227 | preserves baseline behavior |
 | Two corrections | 1568.227 | 1888.227 | rejected correctness candidate |
+| Masked radix-2 hybrid | 91229.445 | 91901.445 | selected cases pass; performance architecture rejected |
+| Chunked C16 robust lower bound | 37979.469 | 38683.461 | selected cases pass; Architecture A rejected |
 
 Caching-only delta:
 
@@ -250,12 +320,22 @@ Caching-only Blackhole remainder disassembly:
 The rejected two-correction speed numbers are only an upper bound and must
 always be labelled unsafe.
 
+The always-present radix-2 hybrid is 31.33x slower than caching-only fmod and
+28.15x slower than caching-only remainder. Blackhole disassembly shows a
+254-iteration scalar loop inside each of the 32 vector iterations. Each stage
+issues 10 SFPU instructions plus two scalar loop instructions even when all
+fallback lanes are predicated off.
+
+The same experimental variants compile for Wormhole. Wormhole disassembly has
+an additional `sfpnop` per fallback stage for post-MAD scheduling. This is
+compile evidence only; no Wormhole hardware result exists.
+
 No end-to-end TTNN measurement completed because the built `ttnn.device` module
 was unavailable. No Wormhole hardware results exist.
 
 ## Documentation and artifact files
 
-Created locally and currently uncommitted:
+The following research artifacts are included in WIP commit `86ba7d8b5e`:
 
 ```text
 docs/SFPI_SCALAR_MODULO_CORRECTNESS_AUDIT.md
@@ -268,20 +348,34 @@ docs/source_snapshots/sfpi_remainder_after.txt
 tools/sfpi_modulo_hybrid_reference.py
 ```
 
-`docs/SFPI_SCALAR_MODULO_HYBRID_RESEARCH.md` has all 18 requested report
-sections and labels claims as Proven, Host verified, Blackhole verified,
-Wormhole verified, Inferred, or Unknown. It currently states Blackhole raw-bit
-diagnostics and hybrid device performance as unknown; update it only after the
-experimental tests below pass.
+`docs/SFPI_SCALAR_MODULO_HYBRID_RESEARCH.md` now has 19 report sections and
+labels claims as Proven, Host verified, Blackhole verified,
+compile-only, Inferred, or Unknown. It now records the completed Blackhole
+diagnostic, selected-case hybrid correctness, disassembly, and performance.
+
+New chunked Architecture A report and host model:
+
+```text
+docs/SFPI_SCALAR_MODULO_CHUNKED_RESEARCH.md
+tools/sfpi_modulo_chunked_reference.py
+```
 
 ## Experimental Blackhole diagnostic/hybrid prototype
 
-The following test-only files were added and are uncommitted:
+The following test-only files are in the WIP commit and have local follow-up
+changes:
 
 ```text
 tt_metal/tt-llk/tests/helpers/include/sfpu_scalar_modulo_hybrid.h
 tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_hybrid_test.cpp
 tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_hybrid.py
+```
+
+New local performance probes:
+
+```text
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_hybrid_perf.cpp
+tt_metal/tt-llk/tests/python_tests/perf_sfpu_scalar_modulo_hybrid.py
 ```
 
 They do not modify the production SFPI API.
@@ -291,18 +385,22 @@ The helper contains:
 - cached reciprocal/truncation fast candidate;
 - the proven `exexp(scaled) < 22` normal-domain classifier;
 - a 254-stage masked radix-2 fallback using `setexp` and `addexp`;
-- signed positive-divisor `fmod` and floor-remainder prototypes;
-- a 32-vector diagnostic output layout.
+- signed `fmod` and floor-remainder prototypes for both scalar signs;
+- a minimal branch-isolated raw-bit diagnostic.
 
 Diagnostic layout:
 
 ```text
-0..8   a, b, reciprocal, scaled, q_hat, pre-correction residual,
-       safe predicate, fast residual, initial scaled divisor
-9..28  fallback residual after steps 0..19
-29     fallback residual after step 23
-30     final fallback magnitude
-31     final positive-divisor fmod result
+0      a
+1      b
+2      reciprocal
+3      scaled
+4      q_hat
+5      residual before correction
+6      residual after positive correction
+7      residual after negative correction
+8      safe predicate
+9..31  repeated final corrected residual
 ```
 
 Python tests cover:
@@ -311,111 +409,285 @@ Python tests cover:
 - safe and unsafe values;
 - positive and negative inputs;
 - exact multiples;
-- both fmod and positive-divisor floor remainder;
+- both scalar signs for fmod and floor remainder;
 - the BF16-exact large counterexample as FP32 input.
 
-Formatting/lint status for the three experimental files:
+Formatting/lint status for all five experimental files:
 
 ```text
 pre-commit: all invoked hooks passed
-git diff --check: passed before the last two-line compile fix
+git diff --check: passed
 ```
 
-### Last device-run status
+### Completed Blackhole diagnostic and correctness status
 
 Command:
 
 ```bash
 cd /home/user/tt-metal/tt_metal/tt-llk/tests/python_tests
+CHIP_ARCH=blackhole PYTHONPATH=/tmp/tt_llk_test_deps \
 python3 -m pytest test_sfpu_scalar_modulo_hybrid.py -q -x -vv
 ```
 
-Attempt 1 failed before SFPI compile because runtime `formats` was not bound.
-That was fixed by adding the same `params.formats` guards used by the standard
-unary test source.
-
-Attempt 2 reached the math compile and reported two C++ issues:
+Result:
 
 ```text
-signed/unsigned comparison: block < params.NUM_BLOCKS
-non-dependent static_assert in a discarded if constexpr branch
+5 passed
 ```
 
-Both were just fixed locally:
+The minimal raw-bit diagnostic exactly confirmed:
 
-- math and pack block loop counters changed from `std::uint32_t` to `int`;
-- the non-dependent static assertion was removed.
+```text
+a                            0x4c400002
+b                            0x40400000
+reciprocal                   0x3eaaaaab
+scaled                       0x4b800002
+q_hat                        0x4b800002
+residual before correction   0xc0800000  (-4)
+after positive correction    0xc0800000  (-4)
+after negative correction    0xbf800000  (-1)
+classifier                   0x00000000  (unsafe)
+```
 
-The server interruption happened immediately after applying that fix. The test
-has not yet been rerun, so no Blackhole raw-bit or hybrid result from this new
-prototype may be claimed yet.
+The first checkpoint-heavy diagnostic caused the SFPI compiler ICE
+`cannot store sfpu register (register spill)`. The minimal diagnostic computes
+each output in a separate scalar branch and passes. The hybrid fmod and
+floor-remainder tests pass bit-exactly for both scalar signs and the selected
+positive/negative, safe/unsafe, exact-multiple, BF16-exact, and
+`3*2^24`-neighbor cases. Floor remainder requires magnitude complementation
+when operand signs differ and restoration of the dividend sign when the exact
+result is zero.
 
-## Exact next steps after restart
+### Completed performance and disassembly status
 
-1. Confirm files and formatting:
+Command:
 
-   ```bash
-   cd /home/user/tt-metal
-   git status -sb
-   git diff --check
-   pre-commit run --files \
-     tt_metal/tt-llk/tests/helpers/include/sfpu_scalar_modulo_hybrid.h \
-     tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_hybrid_test.cpp \
-     tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_hybrid.py
-   ```
+```bash
+CHIP_ARCH=blackhole PYTHONPATH=/tmp/tt_llk_test_deps \
+python3 -m pytest perf_sfpu_scalar_modulo_hybrid.py -q -x -vv
+```
 
-2. Rerun the experimental device tests:
+Result: `2 passed`. MATH_ISOLATE cycles/tile:
 
-   ```bash
-   cd /home/user/tt-metal/tt_metal/tt-llk/tests/python_tests
-   python3 -m pytest test_sfpu_scalar_modulo_hybrid.py -q -x -vv
-   ```
+```text
+fmod       91229.4453125
+remainder  91901.4453125
+```
 
-3. If the SFPI compiler rejects nested predicates, dynamic `setexp`, or the
-   checkpoint selector, change only the experimental helper/source. Do not edit
-   the four production headers for the prototype.
+Blackhole hybrid symbol sizes are 70 encoded instructions for fmod and 91 for
+remainder; the dynamic stage loop is 10 SFPU plus two scalar instructions and
+runs 254 times per vector iteration. The compiler uses `L0` through `L7` with
+no spills. Wormhole compile-only symbol sizes are 79 and 100 instructions, with
+one extra `sfpnop` per dynamic stage.
 
-4. Once the diagnostic passes, capture and record exact Blackhole bits for:
+Wormhole compile-only command:
 
-   ```text
-   a          0x4c400002
-   b          0x40400000
-   reciprocal 0x3eaaaaab
-   scaled     0x4b800002
-   q_hat      0x4b800002
-   residual   expected -4.0
-   classifier expected 0.0 (unsafe)
-   fast result expected -1.0 (invalid)
-   fallback   expected 2.0
-   ```
+```bash
+CHIP_ARCH=wormhole PYTHONPATH=/tmp/tt_llk_test_deps \
+python3 -m pytest test_sfpu_scalar_modulo_hybrid.py \
+    perf_sfpu_scalar_modulo_hybrid.py -q -x -vv --compile-producer
+```
 
-5. Validate mixed-lane behavior and exact signed results. Expand tests for
-   negative scalar semantics before any production recommendation.
+Result: `7 passed` in compile-producer mode across the correctness and
+performance sources. This is not runtime validation.
 
-6. Add a test-only MATH_ISOLATE perf source or mode and measure:
+## Fixed-stage chunked Architecture A prototype
 
-   - all safe lanes;
-   - one unsafe lane;
-   - half unsafe lanes;
-   - all unsafe lanes.
+Test-only files:
 
-   The expected issue is that masked fallback instruction cost remains even for
-   safe lanes.
+```text
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_chunked_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_chunked_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_chunked.py
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_chunked_perf.cpp
+tt_metal/tt-llk/tests/python_tests/perf_sfpu_scalar_modulo_chunked.py
+```
 
-7. Generate experimental math disassembly and record static instruction count,
-   `sfpmul`, MAD, comparisons, replay blocks, register allocation, and spills.
+The direct `q*d` formulation is not proof-safe: SFPMAD preserves four product
+bits beyond binary32, so the effective product width is 28 significant bits.
+A 16-bit quotient times a 24-bit divisor can lose remainder-significant low
+bits. The prototype instead splits the divisor into two <=12-bit components and
+uses one-sided quotient estimation. A zero low component must not be passed
+directly through `setexp`, because raw exponent replacement would manufacture a
+power of two; its scaling is predicated and the corresponding product remains
+zero.
 
-8. Update `docs/SFPI_SCALAR_MODULO_HYBRID_RESEARCH.md` sections 10, 12, 13,
-   14, 15, and 18 with measured Blackhole results.
+The straightforward combined cached-fast-path plus chunked fallback exceeded
+the SFPU register budget and failed compilation with `cannot store sfpu
+register`. A standalone in-place robust reducer compiles without a spill and is
+an honest lower bound on the cost of the combined hybrid. The functional and
+performance sources intentionally measure that standalone reducer.
 
-9. Decide between:
+Final Blackhole compile and runtime commands:
 
-   - an always-present per-lane hybrid;
-   - a host-visible safe/robust kernel variant;
-   - a radix-4 fallback prototype.
+```bash
+CHIP_ARCH=blackhole PYTHONPATH=/tmp/tt_llk_test_deps \
+python3 -m pytest test_sfpu_scalar_modulo_chunked.py \
+    perf_sfpu_scalar_modulo_chunked.py -q -x -vv --compile-producer
 
-10. Only after the above, make the smallest production patch and rerun focused
-    correctness, LLK performance, disassembly, and any available TTNN tests.
+CHIP_ARCH=blackhole PYTHONPATH=/tmp/tt_llk_test_deps \
+python3 -m pytest test_sfpu_scalar_modulo_chunked.py -q -x -vv
+
+CHIP_ARCH=blackhole PYTHONPATH=/tmp/tt_llk_test_deps \
+python3 -m pytest perf_sfpu_scalar_modulo_chunked.py -q -x -vv
+```
+
+Results:
+
+```text
+Blackhole final compile-only       36 passed
+Blackhole functional/raw runtime   28 passed
+Blackhole performance runtime       8 passed
+```
+
+The raw-bit diagnostic passes for divisors `3`, `5`, `7`, and `10` on the
+original disputed large inputs. Signed fmod and floor-remainder tests pass for
+both scalar signs with `3`, `5`, `7`, `10`, FP32 `0.1`, and FP32 `0.3`. This is
+selected normal-domain validation, not exhaustive device correctness.
+
+Blackhole MATH_ISOLATE performance is identical for 0, 1, 16, and 32 unsafe
+lanes because the robust stage loop is always present in the issued instruction
+stream:
+
+| Operation | Cycles/tile | Text bytes | Versus caching-only |
+|---|---:|---:|---:|
+| fmod | 37979.46875 | 2635 | 13.04x slower |
+| remainder | 38683.4609375 | 2723 | 11.85x slower |
+
+This is about 58% cheaper than the rejected masked radix-2 prototype but still
+far above the 10,000-cycle rejection threshold. The combined hybrid cannot be
+cheaper than this standalone lower bound and does not compile without a spill.
+Architecture A is rejected.
+
+Final Blackhole disassembly:
+
+- fmod reducer: 344 bytes, 86 encoded instructions;
+- remainder reducer: 432 bytes, 108 encoded instructions;
+- dynamic stage: 66 SFPU instructions plus two scalar loop instructions,
+  repeated 17 times within each 32-vector tile loop;
+- visible local use is `L0` through `L6`; no compiler spill and no replay.
+
+Final Wormhole compile-only command uses the same two sources and
+`CHIP_ARCH=wormhole`; result: `36 passed`. Wormhole symbol sizes are 372 bytes
+(93 instructions) for fmod and 460 bytes (115 instructions) for remainder. Its
+stage has 73 SFPU instructions plus two scalar loop instructions, including five
+stage-local `sfpnop` instructions. No Wormhole runtime hardware was available.
+
+Final hygiene checks:
+
+```text
+pre-commit on all modified/new research files: all invoked hooks passed
+git diff --check: passed
+production-header diff/status: empty
+```
+
+## Architecture B robust fixed-schedule result
+
+The test-only scalar-specialized reducer precomputes a fixed sequence:
+
+```text
+K0=max(112-Eb,0)
+K=K0,K0-15,...,0
+d=b*2^K
+```
+
+Each local ratio is below `2^16`, so the general FP32 truncation sequence is
+replaced by portable `FP32 -> UINT16 -> FP32` conversion. The two-instruction
+conversion plus a two-component 16b-by-12b SFPMAD subtraction keeps the local
+quotient error in `{0,+1}` and needs one negative correction.
+
+New test-only files:
+
+```text
+tools/sfpi_modulo_fixed_schedule_reference.py
+tools/sfpi_modulo_fixed_schedule_exhaustive.cpp
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_fixed_schedule_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_fixed_schedule_test.cpp
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_fixed_schedule_perf.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_fixed_schedule.py
+tt_metal/tt-llk/tests/python_tests/perf_sfpu_scalar_modulo_fixed_schedule.py
+docs/SFPI_SCALAR_MODULO_FIXED_SCHEDULE_RESEARCH.md
+```
+
+Host results:
+
+```text
+selected deterministic/BF16/random:
+  tested=456700 failures=0 exclusions=1514 q_error=[0,1]
+  schedule_stages=17 active_stages=9 max_q=32768 prehalved=1842
+
+arbitrary normal divisor/random:
+  tested=95002 failures=0 exclusions=5580 q_error=[0,1]
+  schedule_stages=17 active_stages=17 max_q=32768 prehalved=366
+```
+
+Exclusions remain explicit: subnormal/FTZ results and components, reciprocal
+range, and component-subtraction subnormal transients. The exact exponent-127
+pre-reduction closed the three observed top-of-range partial-product overflows.
+
+The optimized C++ verifier exhaustively processed all `2,130,706,432` positive
+normal FP32 dividends for each of `3`, `5`, `7`, `10`, FP32 `0.1`, FP32 `0.3`,
+`8`, `nextDown(8)`, and `nextUp(8)`: all `19,176,357,888` cases passed with no
+exclusion or mismatch. With the smallest normal divisor it processed
+`21,307,064,320` total cases with zero mismatch, but explicitly classified
+184,549,377 smallest-divisor cases as `IntermediateSubnormal`. The largest
+normal divisor is outside the configuration domain because its reciprocal is
+subnormal.
+
+Final device/compiler results:
+
+```text
+Blackhole compile-only                  40 passed
+Wormhole compile-only                   40 passed
+Blackhole functional/diagnostic runtime 32 passed
+Blackhole perf runtime                   8 passed
+```
+
+The raw-bit matrix covers both operations, both scalar signs, divisors `3`,
+`5`, `7`, `10`, FP32 `0.1`, FP32 `0.3`, and power-of-two `8`. Each case now
+contains 231 seeded normal values plus eight exponent-127 cases in addition to
+boundaries/counterexamples. Expected bits now come from an exact integer-lattice
+oracle instead of PyTorch.
+
+Blackhole p150b MATH_ISOLATE for scalar `3`:
+
+| Operation | Cycles/tile | Text bytes | Versus C16 | Versus caching-only |
+|---|---:|---:|---:|---:|
+| fmod | 6171.445 | 2610 | 6.154x faster | 2.119x slower |
+| remainder | 6875.445 | 2698 | 5.626x faster | 2.106x slower |
+
+The 0/1/16/32 active-lane results are effectively identical. Blackhole fmod is
+312 bytes/78 instructions/70 SFPU instructions; remainder is 400 bytes/100/92.
+Both symbols have no spill loads/stores. Wormhole symbols compile at 392 and
+480 bytes with no spills; Wormhole runtime remains unknown.
+
+Blackhole tests with the smallest normal divisor confirmed the remaining FTZ
+boundary. Positive subnormal subtraction results flush to `+0`; a negative
+subnormal can flush to `-0` and enter the negative correction, producing an
+extra divisor. This agrees with the documented SFPMAD denormal flush behavior.
+
+Decision: Architecture B is the preferred direction. Keep `FastBounded` as a
+separate explicit caller-contract specialization and continue hardening this
+fixed schedule as `Robust`. Do not call it globally robust until the documented
+finite-normal exclusions are closed.
+
+## Exact next steps
+
+1. Keep Architecture A rejected; do not combine the cached fast path with an
+   always-issued fallback.
+2. Define special-value, zero-divisor, signed-zero, subnormal, and FTZ semantics,
+   then extend the exact transient model instead of counting exclusions as
+   successes.
+3. Choose and prove an integer/raw or explicitly restricted strategy for the
+   observed FTZ-domain cases.
+4. Review the two explicit Architecture B contracts with the TT/SFPI owner:
+   `FastBounded` selected only from proven range metadata, and fixed-schedule
+   `Robust` as the generic path after its exclusions are closed.
+5. Obtain real Wormhole runtime correctness/performance and tune its dependency
+   schedule; current Wormhole evidence is compile/disassembly only.
+6. Make no production change until the robust proof domain and API/dispatch
+   contract are approved; then rerun host, raw-bit device, disassembly, register,
+   lane-mix, and TTNN validation.
 
 ## Safety and claim rules
 
@@ -424,8 +696,11 @@ prototype may be claimed yet.
 - Preserve unrelated working-tree changes.
 - Do not call the old ten-block reducer mathematically correct.
 - Do not call the two-correction commit correct.
-- Do not call host fallback results Blackhole verified.
+- Blackhole chunked verification covers selected normal cases for divisors
+  `3`, `5`, `7`, `10`, FP32 `0.1`, and FP32 `0.3`; do not generalize it to the
+  full FP32/FTZ/special-value domain.
 - Do not claim Wormhole equivalence without Wormhole hardware or a saved
   Wormhole reference.
-- Keep FTZ/subnormal and special-value behavior explicitly unknown until tested
-  against the documented SFPU contract.
+- Keep special-value policy explicitly unresolved. Treat FTZ/subnormal behavior
+  as measured only for the documented smallest-normal-divisor Blackhole probes;
+  do not generalize it to all inputs or to Wormhole without hardware evidence.

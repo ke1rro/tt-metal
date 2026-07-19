@@ -8,6 +8,8 @@
 #include "llk_defs.h"
 #include "params.h"
 
+// Test-only CHUNK_BITS=16 candidate; changing the helper must rebuild this source.
+
 std::uint32_t unp_cfg_context          = 0;
 std::uint32_t pack_sync_tile_dst_ptr   = 0;
 std::uint32_t math_sync_tile_dst_index = 0;
@@ -44,7 +46,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
 #include "llk_lib_math_wrappers.h"
 #include "llk_math_eltwise_unary_sfpu.h"
 #include "llk_sfpu/llk_math_eltwise_unary_sfpu_macros.h"
-#include "sfpu_scalar_modulo_hybrid.h"
+#include "scalar_modulo_chunked_research.h"
 
 using namespace ckernel;
 
@@ -59,8 +61,7 @@ void run_kernel(RUNTIME_PARAMETERS params)
     _llk_math_pack_sync_init_<DST_SYNC, is_fp32_dest_acc_en>();
 
     SFPU_UNARY_INIT(unused);
-    constexpr std::uint32_t reciprocal = (SFPU_UNARY_SCALAR & 0x80000000u) | 0x3eaaaaabu;
-    sfpu::init_scalar_modulo_research(SFPU_UNARY_SCALAR, reciprocal); // +/-3.0f, fl32(1/scalar)
+    sfpu::init_scalar_modulo_chunked_research(SCALAR_DIVISOR, SCALAR_RECIPROCAL, SCALAR_DIVISOR_HIGH);
 
     LLK_ASSERT(
         (params.NUM_TILES_IN_BLOCK <= get_dest_max_tiles<DST_SYNC, is_fp32_dest_acc_en, DstTileShape::Tile32x32>()),
@@ -76,15 +77,15 @@ void run_kernel(RUNTIME_PARAMETERS params)
 
             if constexpr (FAST_MODE)
             {
-                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_diagnostic, (32), tile, VectorMode::None);
+                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_chunked_diagnostic, (32), tile, VectorMode::None);
             }
             else if constexpr (SFPU_UNARY_OPERATION == SfpuType::fmod)
             {
-                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_hybrid, (false, 32), tile, VectorMode::None);
+                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_chunked_robust, (false, 32), tile, VectorMode::None);
             }
             else
             {
-                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_hybrid, (true, 32), tile, VectorMode::None);
+                SFPU_UNARY_CALL(DST_SYNC, is_fp32_dest_acc_en, calculate_scalar_modulo_chunked_robust, (true, 32), tile, VectorMode::None);
             }
         }
         _llk_math_dest_section_done_<DST_SYNC, is_fp32_dest_acc_en>();

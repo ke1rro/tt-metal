@@ -31,6 +31,10 @@ exact r    = 2.0
 The corrected residual is still negative and therefore violates
 `0 <= r < b`.
 
+**[Empirically verified on Blackhole]** A dedicated p150b raw-bit diagnostic
+reproduced the displayed `a`, `b`, `rho`, `scaled`, `q_hat`, residual, and
+corrected-result bits exactly.
+
 **Recommendation: C.** A different range-reduction algorithm is required for a
 globally correct implementation. Until that algorithm is implemented, only the
 common-subexpression optimization that caches `scaled` is justified as a
@@ -187,16 +191,20 @@ This condition is not directly a complete Tenstorrent correctness condition:
 - exact API output can still differ through residual rounding;
 - checking exact `t` would itself require division.
 
-**[Inferred]** A conservative exponent-gap fast path can be built, but the exact
-threshold must account for significands, reciprocal normality, and SFPU FTZ.
-Using only `scaled_exp < 22` is substantially easier to justify than using
-`scaled_exp < 23`, but it is conservative and has not yet been proven bit-exact
-against all SFPU edge behavior.
+**[Proven under the stated finite-normal RNE assumptions]** The conservative
+classifier `scaled == 0 || scaled_exp < 22` keeps the absolute quotient error
+below one and therefore gives `|q_hat-q|<=1`. The more permissive
+`scaled_exp<23` was not accepted as proven. This quotient bound still excludes
+reciprocal/product overflow, subnormal/FTZ behavior, non-finite values, and a
+global bit-exact SFPU residual claim.
 
 ## 7. Host counterexamples
 
-All values in this table are exact FP32 bit patterns. The true quotient and
-remainder were computed from exact rational representations of those patterns.
+All inputs in this table are exact FP32 bit patterns. The true quotient and
+remainder were computed from exact rational representations. The displayed
+host residual uses a separately rounded FP32 multiply followed by subtraction;
+it is sufficient to expose failure but is not a bit model of partially fused
+SFPMAD. Section 8 records the superseding Blackhole SFPMAD residual bits.
 
 | `b` | `a` | `q` | `q_hat` | `k` | residual before | after two corrections | exact `r` |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -245,18 +253,22 @@ From the local ISA documentation:
 - **[Proven from ISA contract]** multiply-by-one or add-zero matches standalone
   multiply/add aside from documented denormal behavior.
 
-**[Inferred]** The quotient counterexamples should survive on Blackhole because
-they use finite normal operands, the reciprocal is programmed by the host, and
-the quotient error exists before residual formation.
+**[Empirically verified on Blackhole]** Dedicated p150b diagnostics returned:
 
-**[Unknown]** Raw intermediate bit patterns for these adversarial cases have not
-yet been returned by a dedicated Blackhole diagnostic kernel.
+| `b` | `a` bits | RNE reciprocal | `scaled/q_hat` | SFPMAD residual | After one `+b` | Correct chunked result |
+|---:|---:|---:|---:|---:|---:|---:|
+| 3 | `0x4c400002` | `0x3eaaaaab` | `0x4b800002` | `0xc0800000` (-4) | `0xbf800000` (-1) | `0x40000000` (2) |
+| 5 | `0x4ca00003` | `0x3e4ccccd` | `0x4b800003` | `0xc0c00000` (-6) | `0xbf800000` (-1) | `0x40800000` (4) |
+| 7 | `0x4cdd546e` | `0x3e124925` | `0x4b7cf2c8` | `0xc1000000` (-8) | `0xbf800000` (-1) | `0x40c00000` (6) |
+| 10 | `0x4d200003` | `0x3dcccccd` | `0x4b800003` | `0xc1400000` (-12) | `0xc0000000` (-2) | `0x41000000` (8) |
+
+This is direct device confirmation of the disputed global two-correction claim
+for four representative counterexamples. The divisor-5 and divisor-10 SFPMAD
+residuals differ from the separately rounded host residuals in section 7, as
+expected from the documented partially fused product.
 
 **[Unknown]** Wormhole hardware results are unavailable on the current server.
-
-Existing Blackhole tests with divisor `2.0` passed, but they do not exercise the
-inexact-reciprocal counterexamples and therefore are not device confirmation of
-the disputed global claim.
+The experimental tests compile for Wormhole, which is not runtime confirmation.
 
 ## 9. Analysis of the old ten-correction implementation
 
@@ -343,7 +355,10 @@ Recommendation C is an exponent-scaled reduction:
 5. Apply `fmod` or floor-remainder sign semantics afterward.
 
 This is analogous to binary long division and naturally handles large exponent
-gaps. It should be specialized so common bounded ratios use a short fast path.
+gaps. Device measurements show that placing it—or the shorter C16 reducer—behind
+ordinary lane predication makes the common path unacceptably slow. Any bounded
+fast specialization should therefore be a separately compiled
+`FastAssumeBounded` contract rather than an always-present masked fallback.
 
 ### Possible bounded fast path
 
@@ -404,6 +419,28 @@ checkout lacks a usable built TTNN Python module.
 
 **[Unknown]** Wormhole cycles were not measured.
 
+The test-only always-present radix-2 hybrid measured 91,229.445 cycles/tile for
+fmod and 91,901.445 for remainder on Blackhole. This is 31.33x and 28.15x slower
+than caching-only. Disassembly shows why: a 254-stage scalar loop executes inside
+each of 32 vector iterations even when the fallback lanes are predicated off.
+This rejects that dispatch architecture, not the radix-2 correctness argument.
+
+The follow-up fixed-stage C16 standalone robust lower bound measured 37,979.469
+cycles/tile for fmod and 38,683.461 for remainder for every 0/1/16/32-unsafe-lane
+mix. Despite being about 2.4x faster than radix-2, it remains 13.04x and 11.85x
+slower than caching-only and rejects the shorter masked architecture as well.
+See `SFPI_SCALAR_MODULO_CHUNKED_RESEARCH.md`.
+
+The hardened Architecture B scalar-specialized fixed schedule measured
+6,171.445 fmod and 6,875.445 remainder cycles/tile. An exact exponent-127
+pre-reduction closed the observed maximum-FP32 partial-product overflows. An
+integer-lattice C++ verifier exhaustively accepted all 2,130,706,432 positive
+normal dividends for each of nine representative moderate divisors, and the
+Blackhole raw-bit suite passed the former overflow boundaries. The remaining
+global blockers are measured SFPU FTZ/subnormal behavior, reciprocal range,
+special-value policy, and coverage/proof for arbitrary divisors. See
+`SFPI_SCALAR_MODULO_FIXED_SCHEDULE_RESEARCH.md`.
+
 ## 13. Files that should change
 
 Immediate safe patch:
@@ -460,6 +497,7 @@ format-specific output conversion.
 | Does BF16 input make it safe? | **No — host BF16-exact counterexample** |
 | Is the old ten-block reducer globally correct? | **No — Proven** |
 | Is caching `scaled` safe? | **Yes — Proven; measured on Blackhole at 1.0196x-1.0220x** |
-| Are adversarial bits confirmed on Blackhole? | **Unknown** |
+| Are adversarial bits confirmed on Blackhole? | **Yes — exact diagnostics for divisors 3, 5, 7, and 10** |
+| Is a separate robust kernel performance-viable? | **Promising — fixed schedule is below 10k, but proof exclusions remain** |
 | Are they confirmed on Wormhole? | **Unknown** |
 | Is end-to-end TTNN speed measured? | **Unknown** |
