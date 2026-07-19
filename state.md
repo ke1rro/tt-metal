@@ -10,7 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `94ed31d5e7` (`research: characterize scalar modulo raw-pack transport`)
+- HEAD: `ad004d86e8` (`research: validate Blackhole exponent-stationary reducer`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -27,9 +27,12 @@ well as verified results.
   preserves subnormal FP32 encodings through that path; Wormhole's passing
   architecture contract expects signed-zero FTZ through the tested opaque-32
   store and UInt32 pack path.
-- Current uncommitted work adds the test-only Blackhole exponent-stationary
-  normalized reducer, its exact raw-bit silicon test, and its device report.
-  It does not change production headers or implement sign/final packing.
+- Commit `ad004d86e8` is the isolated Blackhole exponent-stationary normalized
+  reducer milestone. It contains only the test helper, microkernel, Python
+  oracle, device report, and this state record requested for that checkpoint.
+- Current uncommitted work adds the separate test-only Blackhole integer RNE
+  finalizer, its exact raw-bit silicon test, and its device report. It does not
+  change production headers or combine the finalizer with the reducer.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -63,13 +66,15 @@ The original design brief and the latest review are in:
 /home/user/.codex/attachments/1fb41107-fe79-4207-9382-2bfe7bea0024/pasted-text.txt
 /home/user/.codex/attachments/8912644b-b9b9-4ce6-be3b-a4df6bbf6a16/pasted-text.txt
 /home/user/.codex/attachments/1a714ba4-a7f6-4b4b-84ef-a20b00685b18/pasted-text.txt
+/home/user/.codex/attachments/2514910e-bf89-4021-a61c-6af61ccc26eb/pasted-text.txt
 ```
 
 Do not integrate Architecture A into production: its host/device research is
 complete enough to reject it on compiler and performance grounds. The raw-pack
 milestone now has real Blackhole and Wormhole silicon evidence. The isolated
-stationary normalized reducer now also has Blackhole compile, silicon, and
-disassembly evidence; physical finalization remains separate.
+stationary normalized reducer and the separate physical finalizer now both
+have Blackhole compile, silicon, and disassembly evidence. They have not yet
+been combined in one kernel.
 
 ## Production header state
 
@@ -809,19 +814,92 @@ does not validate sign semantics, physical normal/subnormal packing,
 special/zero-divisor policy, stationary performance, Wormhole arithmetic, or a
 production operator.
 
+## Blackhole stationary finalizer device gate
+
+Current uncommitted test-only files:
+
+```text
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_stationary_finalizer_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_stationary_finalizer_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_stationary_finalizer.py
+docs/SFPI_SCALAR_MODULO_STATIONARY_FINALIZER_RESEARCH.md
+```
+
+The isolated kernel accepts an already-computed positive normal `R` in the
+stationary exponent-111 frame and implements only:
+
+```text
+normalized R
+    -> exact-zero predicate
+    -> optional normalized D-R for different-sign floor remainder
+    -> integer normal/subnormal RNE pack at physical divisor exponent
+    -> fmod/floor sign restoration
+    -> Blackhole INT32 raw store and UInt32 pack
+```
+
+The finalizer evaluates exact zero before `D-R`. Fmod results, including exact
+zero, use the dividend sign. Nonzero floor remainders use the divisor sign;
+exact zero uses the dividend sign. The four operand-sign combinations are
+compiled and run for both operations.
+
+The normal result path constructs the exponent field and mantissa separately.
+The subnormal path uses a 24-bit significand, explicit discarded/half values,
+ties-to-even increment, natural carry to `0x00800000`, a defined `shift==24`
+underflow boundary, and a zero result for shifts above 24. No physical FP32
+subnormal arithmetic is executed.
+
+Final gate:
+
+```text
+Blackhole compile  13/13 passed
+Blackhole silicon  13/13 passed
+Raw comparisons    13,312
+Designed patterns  97 before tile repetition
+```
+
+The exact integer-lattice oracle covers smallest/next normal, largest/smallest
+subnormal, below/tie-even/tie-odd/above-halfway, rounding carry, underflow tie,
+underflow above tie, and shift-above-24 cases. The matrix contains all four
+sign combinations for `fmod` with divisor `0x00800000`, all four floor cases
+with `0x00800001`, and divisor exponents `-103`, `-104`, `111`, `112`, and
+`127` (`FLT_MAX`). Expected and observed UInt32 word multisets are compared
+because SFPU lane-to-tile placement is outside this gate.
+
+An important lowering observation is recorded without overgeneralizing it:
+greater-than-or-equal normal selectors, first as a float threshold and then as
+an integer exponent predicate, did not open the intended lanes in this nested
+Blackhole code shape. A sentinel isolated the issue to selection, so the
+candidate `addexp`/`setexp` encoders were not the demonstrated cause. The
+passing implementation branches on `normalized_exponent < min_exponent` and
+uses the `else` path for integer normal encoding.
+
+All 13 finalizer symbols compile without spills. High-exponent normal-only
+forms are `0x48` bytes and use `L0-L2`. Full RNE forms are `0xfc-0x104` bytes
+and use `L0-L6`. Different-sign floor `D-R` forms are `0x124-0x128` bytes and
+use the full explicit `L0-L7` budget. Every symbol has exactly one input
+`sfpload`, one `sfpstore ...,0,4,7`, no unexpected Dst reload, and no scalar
+memory operation.
+
+This closes the isolated Blackhole finalizer correctness/raw-transport/register
+gate for the selected normalized inputs. It does not close the combined live
+range, high-divisor `a<b` bypass, special-value policy, performance, Wormhole,
+or production gates.
+
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Keep the passing normalized exponent-stationary magnitude reducer isolated
-   from finalization; use it as the Blackhole arithmetic/register baseline.
-3. For Blackhole only, add the integer normal/subnormal finalizer, perform
-   floor-remainder `D-R` sign adjustment before packing, preserve exact-zero
-   sign, and add the high-divisor `a<b` bypass.
+2. Keep the passing normalized exponent-stationary magnitude reducer and
+   finalizer as separately gated baselines; do not treat their current separate
+   register bounds as proof that the combined symbol will not spill.
+3. For Blackhole only, combine the reducer and finalizer, end reducer live
+   ranges before packing, add the high-divisor `a<b` bypass, and run the
+   smallest-normal, `0x00800001`, exponent-127/pre-half, and `FLT_MAX`
+   end-to-end raw-bit cases.
 4. For Wormhole, either approve an explicit FTZ result contract or first build
    and gate a genuinely different transport such as split 16-bit output. Do not
    present the current raw/UInt32 path as exact.
-5. Compile/disassemble both reducers, reject spills, and run raw-bit,
+5. Compile/disassemble the combined kernel, reject spills, and run raw-bit,
    top-range, correctness, register-pressure, and lane-mix performance tests.
 6. Define special-value, zero-divisor, signed-zero, subnormal-input, and FTZ
    policy at the operator boundary.
@@ -851,5 +929,8 @@ production operator.
   do not generalize it to all inputs or to Wormhole without hardware evidence.
 - Treat the exponent-stationary all-normal-divisor proof as host evidence over
   its documented sweep. Blackhole device evidence covers only the selected
-  normalized-reducer matrix above; performance and physical finalization are
-  still unvalidated.
+  normalized-reducer matrix above; performance is still unvalidated.
+- Treat the isolated Blackhole finalizer as selected normalized-input evidence,
+  not an end-to-end modulo proof. Its 13-case device gate does not establish
+  combined reducer/finalizer register allocation, all FP32 operand pairs,
+  special-value behavior, or Wormhole correctness.
