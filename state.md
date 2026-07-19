@@ -10,7 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `ad004d86e8` (`research: validate Blackhole exponent-stationary reducer`)
+- HEAD: `65ea79474b` (`research: validate Blackhole stationary modulo finalizer`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -30,9 +30,13 @@ well as verified results.
 - Commit `ad004d86e8` is the isolated Blackhole exponent-stationary normalized
   reducer milestone. It contains only the test helper, microkernel, Python
   oracle, device report, and this state record requested for that checkpoint.
-- Current uncommitted work adds the separate test-only Blackhole integer RNE
-  finalizer, its exact raw-bit silicon test, and its device report. It does not
-  change production headers or combine the finalizer with the reducer.
+- Commit `65ea79474b` is the isolated Blackhole integer RNE finalizer milestone.
+  It contains exactly the requested helper, microkernel, Python oracle, device
+  report, and this state record.
+- Current uncommitted work combines the committed stationary reducer and
+  finalizer in a test-only Blackhole kernel, adds an end-to-end raw-bit oracle,
+  and measures reducer/finalizer/combined performance. It does not change
+  production headers.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -73,8 +77,9 @@ Do not integrate Architecture A into production: its host/device research is
 complete enough to reject it on compiler and performance grounds. The raw-pack
 milestone now has real Blackhole and Wormhole silicon evidence. The isolated
 stationary normalized reducer and the separate physical finalizer now both
-have Blackhole compile, silicon, and disassembly evidence. They have not yet
-been combined in one kernel.
+have Blackhole compile, silicon, and disassembly evidence. The current
+test-only combined kernel also passes the selected end-to-end Blackhole raw-bit,
+register, and performance gates; it has not been integrated into production.
 
 ## Production header state
 
@@ -816,7 +821,7 @@ production operator.
 
 ## Blackhole stationary finalizer device gate
 
-Current uncommitted test-only files:
+Committed in `65ea79474b`:
 
 ```text
 tt_metal/tt-llk/tests/helpers/include/scalar_modulo_stationary_finalizer_research.h
@@ -885,30 +890,110 @@ gate for the selected normalized inputs. It does not close the combined live
 range, high-divisor `a<b` bypass, special-value policy, performance, Wormhole,
 or production gates.
 
+## Blackhole combined stationary modulo device gate
+
+Current uncommitted test-only files:
+
+```text
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_stationary_combined_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_stationary_combined_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_stationary_combined.py
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_stationary_combined_perf.cpp
+tt_metal/tt-llk/tests/python_tests/perf_sfpu_scalar_modulo_stationary_combined.py
+docs/SFPI_SCALAR_MODULO_STATIONARY_COMBINED_RESEARCH.md
+```
+
+The combined Blackhole kernel now executes the full selected pipeline:
+
+```text
+input magnitude
+    -> stationary reduction and exponent-127 reconstruction
+    -> exact-zero before optional D-R
+    -> integer normal/subnormal RNE pack
+    -> fmod/floor sign restoration
+    -> one INT32 raw store and UInt32 pack
+```
+
+For `Eb>111`, a physical-frame `a<D` predicate protects tiny bypass inputs from
+underflow during the negative initial normalization. Bypass and reducer are
+disjoint predicated paths, both produce positive raw magnitude bits, and sign
+is restored once after the merge. Exact floor zero is tested before divisor
+sign application, preserving the dividend-signed zero.
+
+Final selected correctness gate:
+
+```text
+Blackhole compile  64/64 passed
+Blackhole silicon  64/64 passed
+Raw comparisons    65,536
+Designed patterns  123 divisor/magnitudes, 984 after operation/sign expansion
+Host active stages 215: q error 0 for 137, +1 for 78
+```
+
+The eight divisors are 3, `0x00800000`, `0x00800001`, `Eb=-103`,
+`Eb=-104`, `Eb=111`, `Eb=112`, and `FLT_MAX`; both operations and all four
+operand-sign combinations are compiled. The raw integer-lattice oracle covers
+`a<b`, equality, exact multiples, the next lattice value, 65534/65535 quotient
+boundaries, the ratio below 65536, signed zero, normal/subnormal results, and
+top-range/pre-half values. The quotient-error count is independent host-model
+evidence; silicon returns the final raw result rather than a separate `q_hat`
+trace.
+
+All 64 combined symbols have exactly one input `sfpload`, one
+`sfpstore ...,0,4,7`, no unexpected Dst reload, and no scalar-memory
+instruction. The compiler stays within explicit `L0-L7`; programmed constants
+occupy architectural constant registers above that range. Symbol sizes are
+`0xc4-0x204`. Forty multi-stage forms contain two schedule `ttreplay`
+instructions, not spills. The combined `Eb=-104` pack retains the passing
+LT-first `sfpiadd ...,0xFA7,1` selector; GTE-first did not return after inline
+combination.
+
+The separate `MATH_ISOLATE` matrix compiled and ran 42/42 performance
+specializations on Blackhole. Representative post-processed cycles/tile:
+
+| Operation/divisor | Reducer | Finalizer | Combined | Combined-reducer |
+|---|---:|---:|---:|---:|
+| fmod / 3 | 6203.430 | 1915.469 | 7963.688 | 1760.258 |
+| fmod / smallest normal | 11067.422 | 1915.516 | 12827.672 | 1760.250 |
+| fmod / `Eb=111` | 1307.453 | 475.422 | 1627.422 | 319.969 |
+| fmod / `Eb=112` | 1403.422 | 475.469 | 2171.422 | 768.000 |
+| floor / 3 | 6203.430 | 2267.477 | 8347.461 | 2144.031 |
+| floor / smallest normal | 11067.422 | 2267.469 | 13211.438 | 2144.016 |
+| floor / `Eb=111` | 1307.453 | 827.430 | 2011.422 | 703.969 |
+| floor / `Eb=112` | 1403.422 | 827.430 | 2683.430 | 1280.008 |
+
+For `Eb<=111`, combined overhead is about 155 cycles below the isolated
+finalizer for fmod and 123 below it for floor remainder, consistent with shared
+setup/load work. The required high-divisor physical bypass adds integration
+cost: the `Eb>111` overhead is about 293 cycles above the isolated fmod
+finalizer and 453 above the isolated floor finalizer. There is no associated
+spill or reload. Full tables are in the combined report.
+
+This closes only the selected test-only Blackhole combined gate. It does not
+define special-value/zero-divisor/subnormal-input policy, prove every FP32 pair,
+establish Wormhole exact output, or authorize a production change.
+
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Keep the passing normalized exponent-stationary magnitude reducer and
-   finalizer as separately gated baselines; do not treat their current separate
-   register bounds as proof that the combined symbol will not spill.
-3. For Blackhole only, combine the reducer and finalizer, end reducer live
-   ranges before packing, add the high-divisor `a<b` bypass, and run the
-   smallest-normal, `0x00800001`, exponent-127/pre-half, and `FLT_MAX`
-   end-to-end raw-bit cases.
-4. For Wormhole, either approve an explicit FTZ result contract or first build
+2. Keep the committed isolated reducer/finalizer and the current general
+   combined kernel as separate correctness baselines. Do not replace them while
+   optimizing the finalizer code shape.
+3. As a test-only optimization, split the combined finalizer at compile time:
+   `Eb>=-103` normal-only and `Eb<-103` full integer subnormal RNE. Repeat raw
+   bits, disassembly, register, and performance gates before considering it.
+4. Define NaN, infinity, zero-divisor, subnormal-input, signed-zero, and FTZ
+   policy at the operator boundary before production integration.
+5. For Wormhole, either approve an explicit FTZ result contract or first build
    and gate a genuinely different transport such as split 16-bit output. Do not
    present the current raw/UInt32 path as exact.
-5. Compile/disassemble the combined kernel, reject spills, and run raw-bit,
-   top-range, correctness, register-pressure, and lane-mix performance tests.
-6. Define special-value, zero-divisor, signed-zero, subnormal-input, and FTZ
-   policy at the operator boundary.
-7. Review the two explicit Architecture B contracts with the TT/SFPI owner:
+6. Review the two explicit Architecture B contracts with the TT/SFPI owner:
    `FastBounded` selected only from proven range metadata, and fixed-schedule
    `Robust` as the generic path after its exclusions are closed.
-8. Obtain Wormhole reducer runtime correctness/performance and tune its
+7. Obtain Wormhole reducer runtime correctness/performance and tune its
    dependency schedule; current Wormhole runtime evidence covers transport only.
-9. Make no production change until the robust proof domain, per-architecture
+8. Make no production change until the robust proof domain, per-architecture
    output semantics, and API/dispatch contract are approved; then rerun host,
    raw-bit device, disassembly, register, lane-mix, and TTNN validation.
 
@@ -929,8 +1014,8 @@ or production gates.
   do not generalize it to all inputs or to Wormhole without hardware evidence.
 - Treat the exponent-stationary all-normal-divisor proof as host evidence over
   its documented sweep. Blackhole device evidence covers only the selected
-  normalized-reducer matrix above; performance is still unvalidated.
+  normalized-reducer and combined matrices above.
 - Treat the isolated Blackhole finalizer as selected normalized-input evidence,
-  not an end-to-end modulo proof. Its 13-case device gate does not establish
-  combined reducer/finalizer register allocation, all FP32 operand pairs,
-  special-value behavior, or Wormhole correctness.
+  not an end-to-end modulo proof by itself. The combined 64-case device gate
+  establishes selected end-to-end Blackhole behavior and register allocation,
+  not all FP32 operand pairs, special-value behavior, or Wormhole correctness.
