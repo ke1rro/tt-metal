@@ -306,4 +306,18 @@ calling the kernel a generic production implementation:
 6. Add planner/API dispatch only after the `FastBounded` and `Robust` contracts
    are explicit and reviewed.
 
-No production integration, commit, or push was performed.
+No production integration or push was performed. This completed milestone was
+later saved in local commit `75855e3002` before starting the normalized-frame
+follow-up.
+
+## 10. Exponent-stationary follow-up
+
+The subsequent host-only normalized-frame architecture closes the measured FTZ
+and reciprocal-range exclusions for its tested domains. It keeps the divisor
+at exponent 111, scales only the residual between stages, and uses an exact
+integer raw pack for the physical result. All positive normal inputs passed for
+the smallest and largest normal divisors, three additional `Eb=-126` boundary
+mantissas, and the nine divisors above: `29,829,890,048` accepted cases with no
+exclusion or mismatch. See
+`SFPI_SCALAR_MODULO_EXPONENT_STATIONARY_RESEARCH.md`. Device implementation and
+performance remain untested.

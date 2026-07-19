@@ -10,7 +10,7 @@ well as verified results.
 
 - Checkout: `/home/user/tt-metal`
 - Branch: `opt/optimize-sfpi-scalar-modulo`
-- HEAD: `65ea79474b` (`research: validate Blackhole stationary modulo finalizer`)
+- HEAD: `7dddc5eefa` (`research: validate Blackhole combined stationary modulo`)
 - Tracking remote: `origin/opt/optimize-sfpi-scalar-modulo`
 - Fork: `https://github.com/ke1rro/tt-metal.git`
 - Git identity requested by the user:
@@ -33,10 +33,13 @@ well as verified results.
 - Commit `65ea79474b` is the isolated Blackhole integer RNE finalizer milestone.
   It contains exactly the requested helper, microkernel, Python oracle, device
   report, and this state record.
-- Current uncommitted work combines the committed stationary reducer and
-  finalizer in a test-only Blackhole kernel, adds an end-to-end raw-bit oracle,
-  and measures reducer/finalizer/combined performance. It does not change
-  production headers.
+- Commit `7dddc5eefa` is the test-only Blackhole combined stationary modulo
+  milestone. It contains exactly the requested seven files and has not been
+  pushed.
+- Current uncommitted work is the separate test-only Blackhole
+  `FastBoundedExactBH` milestone: helper, correctness source/oracle, performance
+  comparison, and research report. It does not change production headers and
+  must remain uncommitted for review.
 - `tt-isa-documentation/` is an untracked user-supplied directory. Do not stage,
   edit, or delete it.
 - `.agents/` is also untracked and unrelated. Preserve it.
@@ -57,9 +60,10 @@ unsafe/large quotient range
 If Architecture A misses correctness, compiler, or performance gates, stop it
 and specify Architecture B as separate `FastBounded` and `Robust` compiled
 kernels without an automatic tensor scan. Architecture A missed the
-compiler/performance gates. Architecture B's robust scalar-specialized fixed
-schedule has now been prototyped and passes the weak Blackhole `<10k` gate on
-the exhaustively verified fixed-divisor normal domains documented below.
+compiler/performance gates. Architecture B now has two separate test-only
+Blackhole implementations: committed stationary Robust and uncommitted
+FastBounded selected by an explicit pre-launch quotient contract. Neither is
+integrated into production.
 
 The original design brief and the latest review are in:
 
@@ -71,15 +75,18 @@ The original design brief and the latest review are in:
 /home/user/.codex/attachments/8912644b-b9b9-4ce6-be3b-a4df6bbf6a16/pasted-text.txt
 /home/user/.codex/attachments/1a714ba4-a7f6-4b4b-84ef-a20b00685b18/pasted-text.txt
 /home/user/.codex/attachments/2514910e-bf89-4021-a61c-6af61ccc26eb/pasted-text.txt
+/home/user/.codex/attachments/cbb8d8af-8b6c-4a99-91c1-0d7bd0aa34da/pasted-text.txt
+/home/user/.codex/attachments/60d032e3-2eae-46e8-95ab-664b759bc927/pasted-text.txt
 ```
 
 Do not integrate Architecture A into production: its host/device research is
 complete enough to reject it on compiler and performance grounds. The raw-pack
 milestone now has real Blackhole and Wormhole silicon evidence. The isolated
 stationary normalized reducer and the separate physical finalizer now both
-have Blackhole compile, silicon, and disassembly evidence. The current
-test-only combined kernel also passes the selected end-to-end Blackhole raw-bit,
-register, and performance gates; it has not been integrated into production.
+have Blackhole compile, silicon, and disassembly evidence. The committed
+test-only combined kernel and uncommitted FastBounded kernel both pass their
+selected end-to-end Blackhole raw-bit, register, and performance gates. Neither
+has been integrated into production.
 
 ## Production header state
 
@@ -892,7 +899,7 @@ or production gates.
 
 ## Blackhole combined stationary modulo device gate
 
-Current uncommitted test-only files:
+Committed test-only milestone files (`7dddc5eefa`, including this state record):
 
 ```text
 tt_metal/tt-llk/tests/helpers/include/scalar_modulo_stationary_combined_research.h
@@ -973,27 +980,137 @@ This closes only the selected test-only Blackhole combined gate. It does not
 define special-value/zero-divisor/subnormal-input policy, prove every FP32 pair,
 establish Wormhole exact output, or authorize a production change.
 
+## Blackhole FastBounded exact modulo device gate
+
+Current uncommitted test-only files:
+
+```text
+tt_metal/tt-llk/tests/helpers/include/scalar_modulo_fast_bounded_research.h
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_fast_bounded_test.cpp
+tt_metal/tt-llk/tests/python_tests/test_sfpu_scalar_modulo_fast_bounded.py
+tt_metal/tt-llk/tests/sources/sfpu_scalar_modulo_fast_bounded_perf.cpp
+tt_metal/tt-llk/tests/python_tests/perf_sfpu_scalar_modulo_fast_bounded.py
+docs/SFPI_SCALAR_MODULO_FAST_BOUNDED_RESEARCH.md
+state.md
+```
+
+The historical one-shot `A-q_hat*D` candidate is not exact on Blackhole inside
+the bounded quotient range. SFPMAD's partially fused large product can discard
+remainder bits even when the quotient estimate is exact or one high. Concrete
+regressions are `a=0x4b46b792,b=0x4046beae` and
+`a=0x4b5df984,b=0x40687b64`. The global RN estimate can also be one low at
+`a=0x5e6e2232,b=0x537f6bdb`. Do not reuse the rejected candidate's
+`1568/1888 cycles/tile` measurements as an exact FastBounded result.
+
+The accepted caller contract specializes the divisor into exponent-103 and
+computes the actual RN values:
+
+```text
+D103 = scale(abs(b), 103-Eb)
+A103 = scale(abs(a), 103-Eb)
+rho  = RN32(1/D103)
+s    = RN32(A103*rho)
+
+abs(a)<abs(b)
+or
+(s is finite && (s==0 || exexp(s)<22))
+```
+
+The caller selects FastBounded before launch. There is no lane-local classifier
+or Robust fallback. The global host audit observes
+`q_hat-q in {-1,0,+1}`.
+
+The actual exact reducer uses two short one-sided local stages:
+
+```text
+A103
+  -> reduce once by D111=256*D103
+  -> reduce once by D103
+  -> exact exponent shift to R111
+  -> committed exact D-R/sign/integer-RNE/raw finalizer
+```
+
+Each divisor is split into two at-most-12-bit components. The first exact local
+quotient is at most `2^14`, with estimate at most `2^14+1`; the second exact
+quotient is below `2^8`, with estimate at most `2^8`. UInt16 RTZ conversion is
+therefore sufficient. Every local audit error is in `{0,+1}`, each partial
+product fits the established 28-bit SFPMAD shape, and one negative correction
+restores the exact lattice remainder.
+
+Selected final gate:
+
+```text
+Host contract/quotient audit       passed
+Blackhole compile                  89/89 passed
+Blackhole silicon                  89/89 passed
+Device specializations             88
+Raw UInt32 comparisons              90,112
+Logical operation/sign patterns     2,296
+Global q errors                     {-1,0,+1}
+Local stage q errors                {0,+1}
+Required output classes             zero/normal/subnormal/min/max passed
+```
+
+The eleven divisors are the combined matrix's eight standard classes plus the
+three rejected-one-shot regressions. Both operations and all four sign
+combinations compile and run. Actual last-safe/first-unsafe boundaries, quotient
+targets around `2^21` and `2^22`, exact multiples and adjacent FP32 values are
+included. Unsafe boundary values are rejected by the host contract rather than
+sent to the Fast kernel. The raw gate compares word multisets because FP32 input
+and UInt32 output tile lane placement is outside this arithmetic gate; a future
+production test must add lane-aware mapping.
+
+All 88 exact symbols have one input `sfpload`, one raw
+`sfpstore ...,0,4,7`, no scalar memory, no call or Robust fallback symbol, and
+use explicit locals only through `L7`. Symbol sizes are `0xec-0x1d8` bytes.
+All eight `Eb=-104` forms retain the first LT classifier
+`sfpiadd ...,0xFA7,1`; a later MOD1=5 occurrence is expected.
+
+Identical `MATH_ISOLATE` Fast-versus-Robust results:
+
+| Operation/divisor | Fast | Robust | Robust/Fast |
+|---|---:|---:|---:|
+| fmod / 3 | 4027.430 | 7963.688 | 1.977x |
+| fmod / smallest normal | 4027.445 | 12827.672 | 3.185x |
+| fmod / `Eb=-103` | 4027.445 | 12219.672 | 3.034x |
+| fmod / `Eb=-104` | 4027.445 | 12219.672 | 3.034x |
+| fmod / `Eb=111` | 2587.422 | 1627.422 | 0.629x |
+| fmod / `Eb=112` | 2491.445 | 2171.422 | 0.872x |
+| floor / 3 | 4379.430 | 8347.461 | 1.906x |
+| floor / smallest normal | 4379.422 | 13211.438 | 3.017x |
+| floor / `Eb=-103` | 4379.422 | 12603.438 | 2.878x |
+| floor / `Eb=-104` | 4379.422 | 12603.438 | 2.878x |
+| floor / `Eb=111` | 2939.422 | 2011.422 | 0.684x |
+| floor / `Eb=112` | 3003.445 | 2683.430 | 0.893x |
+
+Fast is 1.91-3.19x faster for the measured low/mid exponent classes. Robust is
+12-59% faster for `Eb>=111`, where its stationary schedule is already shorter
+than the fixed two Fast stages. Future dispatch must consider both proven input
+range and the divisor specialization.
+
+This Fast implementation is Blackhole-only: it uses BH UInt16 RTZ conversion
+and the BH exact raw/subnormal finalizer. Wormhole needs a different truncation
+and transport implementation or an explicitly approved FTZ contract.
+
 ## Exact next steps
 
 1. Keep Architecture A rejected; do not combine the cached fast path with an
    always-issued fallback.
-2. Keep the committed isolated reducer/finalizer and the current general
-   combined kernel as separate correctness baselines. Do not replace them while
-   optimizing the finalizer code shape.
-3. As a test-only optimization, split the combined finalizer at compile time:
-   `Eb>=-103` normal-only and `Eb<-103` full integer subnormal RNE. Repeat raw
-   bits, disassembly, register, and performance gates before considering it.
-4. Define NaN, infinity, zero-divisor, subnormal-input, signed-zero, and FTZ
+2. Leave the completed FastBounded research files uncommitted for review. Keep
+   committed combined Robust as the independent generic correctness baseline.
+3. Review the two explicit Architecture B entry contracts with the TT/SFPI
+   owner. Fast selection requires both proven range metadata and a divisor
+   specialization for which Fast is actually cheaper; use Robust otherwise.
+4. Add a lane-aware FP32-input/UInt32-output mapping gate, then define NaN,
+   infinity, zero-divisor, subnormal-input, signed-zero, and FTZ
    policy at the operator boundary before production integration.
 5. For Wormhole, either approve an explicit FTZ result contract or first build
-   and gate a genuinely different transport such as split 16-bit output. Do not
-   present the current raw/UInt32 path as exact.
-6. Review the two explicit Architecture B contracts with the TT/SFPI owner:
-   `FastBounded` selected only from proven range metadata, and fixed-schedule
-   `Robust` as the generic path after its exclusions are closed.
-7. Obtain Wormhole reducer runtime correctness/performance and tune its
-   dependency schedule; current Wormhole runtime evidence covers transport only.
-8. Make no production change until the robust proof domain, per-architecture
+   and gate a different RTZ conversion and transport such as split 16-bit
+   output. Do not present the Blackhole Fast implementation as portable.
+6. As a later test-only optimization, split the finalizer at compile time:
+   `Eb>=-103` normal-only and `Eb<-103` full integer subnormal RNE, then repeat
+   raw-bit, disassembly, register, and performance gates.
+7. Make no production change until the robust proof domain, per-architecture
    output semantics, and API/dispatch contract are approved; then rerun host,
    raw-bit device, disassembly, register, lane-mix, and TTNN validation.
 
@@ -1004,6 +1121,12 @@ establish Wormhole exact output, or authorize a production change.
 - Preserve unrelated working-tree changes.
 - Do not call the old ten-block reducer mathematically correct.
 - Do not call the two-correction commit correct.
+- Do not quote `1568/1888 cycles/tile` as the cost of exact FastBounded; those
+  measurements belong to the rejected one-shot body.
+- Treat FastBounded silicon evidence as selected normal-input/divisor evidence
+  under its explicit pre-launch contract, not an exhaustive all-FP32 proof.
+- Do not select Fast merely because the quotient contract passes: measured
+  `Eb>=111` Robust specializations are cheaper.
 - Blackhole chunked verification covers selected normal cases for divisors
   `3`, `5`, `7`, `10`, FP32 `0.1`, and FP32 `0.3`; do not generalize it to the
   full FP32/FTZ/special-value domain.
