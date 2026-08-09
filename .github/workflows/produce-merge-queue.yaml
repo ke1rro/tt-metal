@@ -204,6 +204,7 @@ jobs:
              generated/merge_queue/${TS}_merge_queue_snapshot.json
 
       - name: Upload merge queue data via SFTP
+        if: ${{ secrets.SFTP_MERGE_QUEUE_WRITER_KEY != '' && secrets.SFTP_MERGE_QUEUE_WRITER_USERNAME != '' && secrets.SFTP_MERGE_QUEUE_WRITER_HOSTNAME != '' }}
         uses: ./.github/actions/upload-data-via-sftp
         with:
           ssh-private-key: ${{ secrets.SFTP_MERGE_QUEUE_WRITER_KEY }}
