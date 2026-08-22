@@ -26,6 +26,7 @@
 #include "tt-metalium/tile.hpp"
 #include "tt-metalium/workload_descriptor.hpp"
 #include "ttnn/operations/wavelet/common/wavelet_host.hpp"
+#include "ttnn/operations/wavelet/generated/wavelet_schemes/scheme_dispatch.hpp"
 #include "ttnn/operations/wavelet/planner/inverse_plan_2d.hpp"
 #include "ttnn/operations/wavelet/planner/plan_2d.hpp"
 #include "ttnn/operations/wavelet/planner/policy.hpp"

@@ -28,6 +28,7 @@
 #include "ttnn/operations/wavelet/common/storage_contract.hpp"
 #include "ttnn/operations/wavelet/common/wavelet_host.hpp"
 #include "ttnn/operations/wavelet/device/protocol/lwt_config.hpp"
+#include "ttnn/operations/wavelet/generated/wavelet_schemes/scheme_dispatch.hpp"
 #include "ttnn/operations/wavelet/planner/inverse_plan.hpp"
 #include "ttnn/operations/wavelet/planner/l1_accounting.hpp"
 #include "ttnn/operations/wavelet/planner/policy.hpp"
