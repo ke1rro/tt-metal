@@ -12,11 +12,10 @@
 
 namespace ttnn::operations::wavelet {
 
-/** Parameters for the virtual 1D extension applied before the even/odd split. */
 struct Pad1DConfig {
-    BoundaryMode mode{BoundaryMode::kSymmetric};  ///< Extension mode at both boundaries.
-    uint32_t left{0};                             ///< Samples virtually prepended to the signal.
-    uint32_t right{0};                            ///< Samples virtually appended to the signal.
+    BoundaryMode mode{BoundaryMode::kSymmetric};
+    uint32_t left{0};
+    uint32_t right{0};
 };
 
 struct PadSplit1DLayout {
@@ -30,11 +29,10 @@ struct PadSplit1DLayout {
 };
 
 [[nodiscard]] constexpr PadSplit1DLayout make_pad_split_1d_layout(
-    const SignalBuffer& input, const uint64_t even_addr, const uint64_t odd_addr, const Pad1DConfig config) noexcept {
+    const SignalBuffer& input, const Pad1DConfig config) noexcept {
     const size_t length = input.length + static_cast<size_t>(config.left) + static_cast<size_t>(config.right);
 
-    return PadSplit1DLayout{
-        .input = input, .pad_config = config, .output = make_split_signal(input, length, even_addr, odd_addr)};
+    return PadSplit1DLayout{.input = input, .pad_config = config, .output = make_split_signal(input, length)};
 }
 
 }  // namespace ttnn::operations::wavelet
