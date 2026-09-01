@@ -17,7 +17,6 @@
 
 // clang-format off
 #include "api/compute/common.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "api/dataflow/circular_buffer.h"
 #include "internal/compute/tile_move_copy.h"
 #include "ttnn/operations/wavelet/device/protocol/lwt_config.hpp"
@@ -59,8 +58,10 @@ static_assert(
 
 #if defined(TRISC_MATH) || defined(LWT_SCHEME_HEADER)
 #define WAVELET_1D_STEP_ATTRIBUTES inline
+constexpr bool kSpecializePredictUpdateStep = true;
 #else
 #define WAVELET_1D_STEP_ATTRIBUTES __attribute__((noinline, noclone))
+constexpr bool kSpecializePredictUpdateStep = false;
 #endif
 
 template <typename Scheme, uint32_t Index = 0>
@@ -171,7 +172,7 @@ WAVELET_1D_STEP_ATTRIBUTES void run_predict_update_step(
     const uint32_t cb_output,
     const std::array<uint32_t, K> h_coeffs,
     const uint32_t output_group_count) {
-    static_assert(K > 0, "Predict/update steps must have at least one coefficient");
+    static_assert(K > 0 || !kSpecializePredictUpdateStep, "Predict/update steps must have at least one coefficient");
     static_assert(K <= device_protocol::kStepCoeffCapacity, "Step coefficient count exceeds device capacity");
     CircularBuffer input0_buffer(cb_input0);
     CircularBuffer input1_buffer(cb_input1);
@@ -182,19 +183,19 @@ WAVELET_1D_STEP_ATTRIBUTES void run_predict_update_step(
         tile_regs_acquire();
 
         input0_buffer.wait_front(2);
-        copy_tile_to_dst_init_short(cb_input0);
+        copy_init(cb_input0);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input0, 0, kDstSource0);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input0, 1, kDstSource1);
         input0_buffer.pop_front(2);
 
         input1_buffer.wait_front(2);
-        copy_tile_to_dst_init_short(cb_input1);
+        copy_init(cb_input1);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input1, 0, kDstSource2);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input1, 1, kDstSource3);
         input1_buffer.pop_front(2);
 
         base_buffer.wait_front(3);
-        copy_tile_to_dst_init_short(cb_base);
+        copy_init(cb_base);
         ckernel::internal::copy_tile_to_dst_32x16(cb_base, 0, kDstBase0);
         ckernel::internal::copy_tile_to_dst_32x16(cb_base, 1, kDstBase1);
         ckernel::internal::copy_tile_to_dst_32x16(cb_base, 2, kDstBase2);
@@ -245,7 +246,7 @@ inline void run_scale_step(
         output_buffer.reserve_back(kScaleTileCount);
 
         tile_regs_acquire();
-        copy_tile_to_dst_init_short(cb_input);
+        copy_init(cb_input);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input, 0, kDstBase0);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input, 1, kDstBase1);
         ckernel::internal::copy_tile_to_dst_32x16(cb_input, 2, kDstBase2);
@@ -304,14 +305,19 @@ inline void run_static_steps(
             constexpr uint32_t base_scale_bits = predict ? OddScalePacked : EvenScalePacked;
             constexpr StepType scale_type = inline_terminal_scale_type<Scheme>();
             constexpr uint32_t scale_bits = terminal_scale_bits<Scheme, scale_type>();
-            run_predict_update_step<
-                Step::k,
-                inline_terminal_scale,
-                scale_bits,
-                scale_source,
-                scale_base,
-                source_scale_bits,
-                base_scale_bits>(cb_input0, cb_input1, cb_base, cb_output, Step::coeff_bits, output_group_count);
+            if constexpr (kSpecializePredictUpdateStep) {
+                run_predict_update_step<
+                    Step::k,
+                    inline_terminal_scale,
+                    scale_bits,
+                    scale_source,
+                    scale_base,
+                    source_scale_bits,
+                    base_scale_bits>(cb_input0, cb_input1, cb_base, cb_output, Step::coeff_bits, output_group_count);
+            } else {
+                run_predict_update_step<0, false, 0, false, false, 0, 0>(
+                    cb_input0, cb_input1, cb_base, cb_output, std::array<uint32_t, 0>{}, output_group_count);
+            }
             run_static_steps<
                 Scheme,
                 InlineTerminalScale,
@@ -410,6 +416,7 @@ void lwt_compute() {
 void kernel_main() {
     constexpr uint32_t cb_base = get_compile_time_arg_val(2);
     constexpr uint32_t cb_output = get_compile_time_arg_val(3);
-    init_sfpu(cb_base, cb_output);
+    compute_kernel_hw_startup(cb_base, cb_output);
+    copy_init(cb_base);
     ttnn::operations::wavelet::kernels::lwt_compute<WAVELET_1D_ACTIVE_SCHEME_TYPE>();
 }

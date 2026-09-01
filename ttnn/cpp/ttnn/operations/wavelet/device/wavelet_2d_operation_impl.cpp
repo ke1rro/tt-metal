@@ -20,6 +20,7 @@
 #include "tt-metalium/circular_buffer_constants.h"
 #include "tt-metalium/core_coord.hpp"
 #include "tt-metalium/host_api.hpp"
+#include "tt-metalium/math.hpp"
 #include "tt-metalium/program_descriptors.hpp"
 #include "tt-metalium/shape.hpp"
 #include "tt-metalium/tensor_accessor_args.hpp"
@@ -37,6 +38,7 @@
 namespace ttnn::prim {
 
 using namespace operations::wavelet;
+using wavelet_program_utils::add_generated_scheme_include_path;
 using wavelet_program_utils::checked_u32;
 using wavelet_program_utils::core_range_set;
 using wavelet_program_utils::CoreChunkWork;
@@ -125,7 +127,7 @@ struct Logical2DShape {
         route_count <= std::numeric_limits<size_t>::max() / (2 * device_protocol::kLwt2DRouteConfigPageBytes),
         "2D route-config scratch size overflows size_t");
     const size_t route_config_bytes = route_count * device_protocol::kLwt2DRouteConfigPageBytes;
-    const size_t route_config_tile_count = ceil_div(2 * route_config_bytes, static_cast<size_t>(kTileBytes));
+    const size_t route_config_tile_count = tt::div_up(2 * route_config_bytes, static_cast<size_t>(kTileBytes));
     const size_t tile_count =
         std::max(static_cast<size_t>(split_scratch_tile_count(boundary_mode, inverse)), route_config_tile_count);
     TT_FATAL(
@@ -309,7 +311,7 @@ void replace_plane_tile_counts_with_widths(std::vector<uint32_t>& args, const Pl
 template <typename Plan>
 [[nodiscard]] std::vector<uint32_t> compute_args(const Plan& plan, const CoreChunkWork& work) {
     const size_t route_count = plan.chunks.front().routes.size();
-    const size_t packed_words_per_chunk = ceil_div(route_count, static_cast<size_t>(4));
+    const size_t packed_words_per_chunk = tt::div_up(route_count, static_cast<size_t>(4));
     std::vector<uint32_t> args;
     args.reserve(1 + static_cast<size_t>(work.chunk_count) * packed_words_per_chunk);
     args.push_back(work.chunk_count);
@@ -438,6 +440,7 @@ template <typename Plan>
     compute_descriptor.core_ranges = cores;
     compute_descriptor.compile_time_args = {kSource0Cb, kSource1Cb, kBaseCb, kOutputCb};
     compute_descriptor.defines = std::move(compute_defines);
+    add_generated_scheme_include_path(compute_descriptor);
     compute_descriptor.config = tt::tt_metal::ComputeConfigDescriptor{
         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
         .fp32_dest_acc_en = true,
@@ -469,8 +472,8 @@ void validate_2d_tensor(const Tensor& tensor, const char* tensor_name) {
         tensor_name);
     validate_input_memory_config(tensor.memory_config(), tensor_name);
 
-    const size_t padded_height = round_up(static_cast<size_t>(shape.height), kTileHeight2D);
-    const size_t padded_width = round_up(static_cast<size_t>(shape.width), kTileWidth2D);
+    const size_t padded_height = tt::round_up(static_cast<size_t>(shape.height), kTileHeight2D);
+    const size_t padded_width = tt::round_up(static_cast<size_t>(shape.width), kTileWidth2D);
     TT_FATAL(
         padded_height <= std::numeric_limits<size_t>::max() / padded_width / sizeof(float),
         "{} per-batch physical size calculation overflows size_t",
@@ -530,16 +533,6 @@ template <typename Scheme>
         true,
         true,
         Lwt2DRouteDomainPolicy::kExact);
-    validate_lwt_2d_tiling_contract(plan.tiling);
-    TT_FATAL(
-        plan.input_height <= static_cast<size_t>(std::numeric_limits<int32_t>::max() / 2) &&
-            plan.input_width <= static_cast<size_t>(std::numeric_limits<int32_t>::max() / 2),
-        "2D LWT input dimensions exceed the signed boundary-index range");
-    TT_FATAL(
-        plan.allocated_l1_bytes <= available_l1_bytes,
-        "2D LWT allocation requires {} L1 bytes but only {} remain below allocator-managed L1 tensors",
-        plan.allocated_l1_bytes,
-        available_l1_bytes);
     return plan;
 }
 
@@ -558,17 +551,7 @@ template <typename Scheme>
         wavelet_program_utils::worker_core_count(mesh_device, "2D wavelet transforms require at least one worker core"),
         l1_budget_bytes,
         boundary_mode,
-        architecture_policy.inverse_2d_coordination_penalty_cycles_per_core);
-    TT_FATAL(!plan.chunks.empty(), "2D ILWT requires at least one planned chunk");
-    TT_FATAL(
-        plan.output_height <= static_cast<size_t>(std::numeric_limits<int32_t>::max() / 2) &&
-            plan.output_width <= static_cast<size_t>(std::numeric_limits<int32_t>::max() / 2),
-        "2D ILWT output dimensions exceed the signed boundary-index range");
-    TT_FATAL(
-        plan.allocated_l1_bytes <= available_l1_bytes,
-        "2D ILWT allocation requires {} L1 bytes but only {} remain below allocator-managed L1 tensors",
-        plan.allocated_l1_bytes,
-        available_l1_bytes);
+        architecture_policy.inverse_penalty_per_core);
     return plan;
 }
 

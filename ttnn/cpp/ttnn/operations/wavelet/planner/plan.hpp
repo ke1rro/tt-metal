@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <limits>
 #include <tt_stl/assert.hpp>
-#include <tuple>
 #include <vector>
 
 #include "ttnn/operations/wavelet/common/boundary.hpp"
@@ -78,11 +77,18 @@ struct StreamState {
     size_t length{0};
 };
 
+struct StepGeometry {
+    int output_shift{0};
+    size_t output_length{0};
+    size_t source_offset{0};
+    size_t base_offset{0};
+};
+
 [[nodiscard]] constexpr RouteOutputRef workspace_output(const StorageSlot slot) noexcept {
     return RouteOutputRef{.storage = RouteOutputStorage::kWorkspaceSlot, .slot = slot};
 }
 
-[[nodiscard]] inline std::tuple<int, size_t, size_t, size_t> compute_step_geometry(
+[[nodiscard]] inline StepGeometry compute_step_geometry(
     const StreamState& source, const int kernel_shift, const size_t k, const StreamState& base) {
     const int conv_shift = source.shift + kernel_shift + static_cast<int>(std::min(source.length, k)) - 1;
     const size_t conv_length = source.length >= k ? source.length - k + 1 : 0;
@@ -95,7 +101,12 @@ struct StreamState {
     const size_t source_offset = static_cast<size_t>(out_shift - conv_shift);
     const size_t base_offset = static_cast<size_t>(out_shift - base.shift);
 
-    return {out_shift, out_length, source_offset, base_offset};
+    return StepGeometry{
+        .output_shift = out_shift,
+        .output_length = out_length,
+        .source_offset = source_offset,
+        .base_offset = base_offset,
+    };
 }
 
 template <typename Scheme, size_t Index>
@@ -110,8 +121,7 @@ void append_forward_route(
         static_assert(Step::k > 0, "Predict steps must have at least one coefficient");
         static_assert(
             Step::k <= device_protocol::kStepCoeffCapacity, "Predict step exceeds device coefficient capacity");
-        const auto [out_shift, out_length, src_off, base_off] =
-            compute_step_geometry(even_state, Step::shift, Step::k, odd_state);
+        const StepGeometry geometry = compute_step_geometry(even_state, Step::shift, Step::k, odd_state);
         const StreamRef output{.slot = active.free};
         const StorageSlot released = active.odd.slot;
         routes.push_back(LiftingStepRoute{
@@ -121,20 +131,19 @@ void append_forward_route(
             .output = workspace_output(output.slot),
             .source_length = even_state.length,
             .base_length = odd_state.length,
-            .source_offset = src_off,
-            .base_offset = base_off,
+            .source_offset = geometry.source_offset,
+            .base_offset = geometry.base_offset,
             .source_left_pad = device_protocol::kStepCoeffCapacity - Step::k,
-            .output_length = out_length,
+            .output_length = geometry.output_length,
         });
-        odd_state = StreamState{.shift = out_shift, .length = out_length};
+        odd_state = StreamState{.shift = geometry.output_shift, .length = geometry.output_length};
         active.odd = output;
         active.free = released;
     } else if constexpr (Step::type == StepType::kUpdate) {
         static_assert(Step::k > 0, "Update steps must have at least one coefficient");
         static_assert(
             Step::k <= device_protocol::kStepCoeffCapacity, "Update step exceeds device coefficient capacity");
-        const auto [out_shift, out_length, src_off, base_off] =
-            compute_step_geometry(odd_state, Step::shift, Step::k, even_state);
+        const StepGeometry geometry = compute_step_geometry(odd_state, Step::shift, Step::k, even_state);
         const StreamRef output{.slot = active.free};
         const StorageSlot released = active.even.slot;
         routes.push_back(LiftingStepRoute{
@@ -144,12 +153,12 @@ void append_forward_route(
             .output = workspace_output(output.slot),
             .source_length = odd_state.length,
             .base_length = even_state.length,
-            .source_offset = src_off,
-            .base_offset = base_off,
+            .source_offset = geometry.source_offset,
+            .base_offset = geometry.base_offset,
             .source_left_pad = device_protocol::kStepCoeffCapacity - Step::k,
-            .output_length = out_length,
+            .output_length = geometry.output_length,
         });
-        even_state = StreamState{.shift = out_shift, .length = out_length};
+        even_state = StreamState{.shift = geometry.output_shift, .length = geometry.output_length};
         active.even = output;
         active.free = released;
     } else if constexpr (Step::type == StepType::kScaleOdd) {
@@ -250,15 +259,28 @@ template <typename Scheme>
     const SignalBuffer& input, const BoundaryMode boundary_mode = BoundaryMode::kSymmetric) {
     static_assert(Scheme::tap_size > 0, "Static lifting schemes must have a positive tap size");
     static_assert(Scheme::num_steps > 0, "Static lifting schemes must have at least one step");
-    TT_FATAL(input.element_size_bytes == sizeof(float), "Forward lifting plan currently supports fp32 only");
     TT_FATAL(
-        input.length <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
-        "Input length {} exceeds uint32_t runtime limits",
-        input.length);
+        input.stick_width == kStickWidth,
+        "Forward lifting plan requires {}-element sticks, got {}",
+        kStickWidth,
+        input.stick_width);
+    TT_FATAL(input.element_size_bytes == sizeof(float), "Forward lifting plan currently supports fp32 only");
+    constexpr size_t wavelet_pad = static_cast<size_t>(Scheme::tap_size - 1);
+    constexpr size_t total_pad = 2 * wavelet_pad;
+    static_assert(total_pad <= kMaxSignedDeviceIndex);
+    TT_FATAL(
+        input.length <= static_cast<size_t>(kMaxSignedDeviceIndex) - total_pad,
+        "Input length {} with {} elements of padding exceeds the signed device-index limit {}",
+        input.length,
+        total_pad,
+        kMaxSignedDeviceIndex);
 
-    const uint32_t wavelet_pad = static_cast<uint32_t>(Scheme::tap_size - 1);
-    const PadSplit1DLayout preprocess_layout =
-        make_pad_split_1d_layout(input, Pad1DConfig{.mode = boundary_mode, .left = wavelet_pad, .right = wavelet_pad});
+    const PadSplit1DLayout preprocess_layout = make_pad_split_1d_layout(
+        input,
+        Pad1DConfig{
+            .mode = boundary_mode,
+            .left = static_cast<uint32_t>(wavelet_pad),
+            .right = static_cast<uint32_t>(wavelet_pad)});
 
     const SignalBuffer initial_even = preprocess_layout.output.even;
     const SignalBuffer initial_odd = preprocess_layout.output.odd;

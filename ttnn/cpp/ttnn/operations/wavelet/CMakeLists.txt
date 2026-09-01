@@ -4,7 +4,11 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(WAVELET_SCHEME_CATALOG ${CMAKE_CURRENT_SOURCE_DIR}/schemes/wavelet_schemes.json)
 set(WAVELET_SCHEME_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/schemes/generate_wavelet_scheme_headers.py)
-set(WAVELET_GENERATED_SCHEME_DIR ${CMAKE_CURRENT_SOURCE_DIR}/generated/wavelet_schemes)
+set(WAVELET_GENERATED_INCLUDE_ROOT ${PROJECT_BINARY_DIR}/generated/wavelet)
+set(WAVELET_GENERATED_HOST_INCLUDE_DIR ${WAVELET_GENERATED_INCLUDE_ROOT}/ttnn/cpp)
+set(WAVELET_GENERATED_SCHEME_DIR
+    ${WAVELET_GENERATED_HOST_INCLUDE_DIR}/ttnn/operations/wavelet/generated/wavelet_schemes
+)
 
 file(READ ${WAVELET_SCHEME_CATALOG} WAVELET_SCHEME_CATALOG_JSON)
 string(JSON WAVELET_SCHEME_COUNT LENGTH "${WAVELET_SCHEME_CATALOG_JSON}")
@@ -31,7 +35,7 @@ add_custom_command(
     OUTPUT
         ${WAVELET_GENERATED_SCHEME_HEADERS}
     COMMAND
-        ${Python3_EXECUTABLE} ${WAVELET_SCHEME_GENERATOR}
+        ${Python3_EXECUTABLE} ${WAVELET_SCHEME_GENERATOR} ${WAVELET_GENERATED_SCHEME_DIR}
     DEPENDS
         ${WAVELET_SCHEME_GENERATOR}
         ${WAVELET_SCHEME_CATALOG}
@@ -80,14 +84,15 @@ target_sources(
         FILE_SET kernels
         TYPE HEADERS
         BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-        FILES ${kernels} ${WAVELET_GENERATED_SCHEME_HEADERS}
+        FILES ${kernels}
+        FILE_SET generated_schemes
+        TYPE HEADERS
+        BASE_DIRS ${WAVELET_GENERATED_HOST_INCLUDE_DIR}
+        FILES ${WAVELET_GENERATED_SCHEME_HEADERS}
     PRIVATE
         ${TTNN_OP_WAVELET_SRCS}
 )
 
-# The implementation sources instantiate all 106 static schemes. Compile them
-# outside the unity source to avoid anonymous-namespace collisions and an
-# excessively large translation unit.
 set_source_files_properties(
     device/wavelet_1d_operation_impl.cpp
     device/wavelet_2d_operation_impl.cpp
@@ -96,7 +101,13 @@ set_source_files_properties(
             ON
 )
 
+target_include_directories(ttnn_op_wavelet BEFORE PRIVATE ${WAVELET_GENERATED_HOST_INCLUDE_DIR})
 target_include_directories(ttnn_op_wavelet PRIVATE ${FixmeOpIncDirs})
+target_compile_definitions(
+    ttnn_op_wavelet
+    PRIVATE
+        TTNN_WAVELET_GENERATED_INCLUDE_ROOT="${WAVELET_GENERATED_INCLUDE_ROOT}"
+)
 target_link_libraries(ttnn_op_wavelet PUBLIC TTNN::Core PRIVATE TT::Metalium)
 
 install(
@@ -108,6 +119,10 @@ install(
     FILE_SET
     kernels
         DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp/ttnn/operations/wavelet
+        COMPONENT ttnn-runtime
+    FILE_SET
+    generated_schemes
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp
         COMPONENT ttnn-runtime
 )
 

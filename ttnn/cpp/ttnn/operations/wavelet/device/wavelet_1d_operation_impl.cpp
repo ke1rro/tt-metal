@@ -8,7 +8,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -17,10 +16,12 @@
 #include <vector>
 
 #include "tt-logger/tt-logger.hpp"
+#include "tt-metalium/allocator.hpp"
 #include "tt-metalium/buffer.hpp"
 #include "tt-metalium/circular_buffer_constants.h"
 #include "tt-metalium/core_coord.hpp"
 #include "tt-metalium/host_api.hpp"
+#include "tt-metalium/math.hpp"
 #include "tt-metalium/program_descriptors.hpp"
 #include "tt-metalium/tensor_accessor_args.hpp"
 #include "tt-metalium/tile.hpp"
@@ -39,6 +40,10 @@
 namespace ttnn::prim {
 
 using namespace operations::wavelet;
+using operations::wavelet::device_protocol::config_word_index;
+using operations::wavelet::device_protocol::LwtChunkConfigWord;
+using operations::wavelet::device_protocol::RouteConfigWord;
+using wavelet_program_utils::add_generated_scheme_include_path;
 using wavelet_program_utils::checked_u32;
 using wavelet_program_utils::core_range_set;
 using wavelet_program_utils::CoreChunkWork;
@@ -195,7 +200,7 @@ struct Logical1DShape {
 [[nodiscard]] uint32_t tile_mirror_elements(const uint32_t workspace_elements, const bool hybrid_tile_mirror) {
     return hybrid_tile_mirror
                ? checked_u32(
-                     ceil_div(workspace_elements, static_cast<uint32_t>(device_protocol::kLwtGroupOutputElements)) *
+                     tt::div_up(workspace_elements, static_cast<uint32_t>(device_protocol::kLwtGroupOutputElements)) *
                          device_protocol::kLwtGroupOutputElements,
                      "hybrid tile mirror elements")
                : 0U;
@@ -203,7 +208,7 @@ struct Logical1DShape {
 
 [[nodiscard]] uint32_t output_group_count(const size_t output_length) {
     return checked_u32(
-        ceil_div(output_length, static_cast<size_t>(device_protocol::kLwtGroupOutputElements)), "LWT group count");
+        tt::div_up(output_length, static_cast<size_t>(device_protocol::kLwtGroupOutputElements)), "LWT group count");
 }
 
 [[nodiscard]] uint32_t planner_signal_budget_bytes(
@@ -344,13 +349,13 @@ void add_narrow_tile_circular_buffer(
     for (size_t chunk_index = 0; chunk_index < plan.chunks.size(); ++chunk_index) {
         const auto& chunk = plan.chunks[chunk_index];
         const size_t offset = chunk_index * device_protocol::kLwtChunkConfigWordCount;
-        words[offset + device_protocol::kLwtInitialEvenBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kLwtInitialEvenBegin)] =
             checked_u32(chunk.initial_even.begin, "initial even begin");
-        words[offset + device_protocol::kLwtInitialEvenLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kLwtInitialEvenLength)] =
             checked_u32(chunk.initial_even.length(), "initial even length");
-        words[offset + device_protocol::kLwtInitialOddBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kLwtInitialOddBegin)] =
             checked_u32(chunk.initial_odd.begin, "initial odd begin");
-        words[offset + device_protocol::kLwtInitialOddLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kLwtInitialOddLength)] =
             checked_u32(chunk.initial_odd.length(), "initial odd length");
     }
     return words;
@@ -372,23 +377,28 @@ void add_narrow_tile_circular_buffer(
             const uint32_t output_offset = checked_u32(route.output_offset_elements, "LWT output offset");
             const size_t word_offset =
                 (chunk_index * route_count + route_index) * device_protocol::kRouteConfigWordCount;
-            words[word_offset + device_protocol::kRouteType] = static_cast<uint32_t>(route.type);
-            words[word_offset + device_protocol::kRouteSourceAddr] = resolve_workspace_address(buffers, route.source);
-            words[word_offset + device_protocol::kRouteSourceLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteType)] = static_cast<uint32_t>(route.type);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceAddr)] =
+                resolve_workspace_address(buffers, route.source);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceLength)] =
                 checked_u32(route.source_storage_length, "LWT source storage end");
-            words[word_offset + device_protocol::kRouteBaseAddr] = resolve_workspace_address(buffers, route.base);
-            words[word_offset + device_protocol::kRouteBaseLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseAddr)] =
+                resolve_workspace_address(buffers, route.base);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseLength)] =
                 checked_u32(route.base_storage_length, "LWT base storage end");
-            words[word_offset + device_protocol::kRouteOutputAddr] = resolve_output_address(buffers, route.output);
-            words[word_offset + device_protocol::kRouteOutputLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputAddr)] =
+                resolve_output_address(buffers, route.output);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputLength)] =
                 checked_u32(route.output_length, "LWT output length");
-            words[word_offset + device_protocol::kRouteSourceOffset] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceOffset)] =
                 checked_u32(route.source_offset_elements, "LWT source offset");
-            words[word_offset + device_protocol::kRouteBaseOffset] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseOffset)] =
                 checked_u32(route.base_offset_elements, "LWT base offset");
-            words[word_offset + device_protocol::kRouteSourceLeftPad] = route.source_left_pad_elements;
-            words[word_offset + device_protocol::kRouteOutputOffset] = output_offset;
-            words[word_offset + device_protocol::kRouteGroupCount] = output_group_count(route.output_length);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceLeftPad)] =
+                route.source_left_pad_elements;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputOffset)] = output_offset;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteGroupCount)] =
+                output_group_count(route.output_length);
             uint32_t route_flags = 0;
             if (route.output.storage == RouteOutputStorage::kFinalEvenDram) {
                 route_flags = device_protocol::kRouteFlagFinalDram | device_protocol::kRouteFlagFinalEven;
@@ -406,7 +416,7 @@ void add_narrow_tile_circular_buffer(
                 route_flags |= produces_tile_mirror ? device_protocol::kRouteFlagOutputTileMirror : 0U;
                 tile_mirror_valid[static_cast<size_t>(route.output.slot)] = produces_tile_mirror;
             }
-            words[word_offset + device_protocol::kRouteFlags] = route_flags;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteFlags)] = route_flags;
         }
     }
     return words;
@@ -485,7 +495,8 @@ void add_narrow_tile_circular_buffer(
     const std::vector<CoreChunkWork>& work,
     const uint32_t chunks_per_sample,
     const uint32_t input_pages_per_sample,
-    const uint32_t output_pages_per_sample) {
+    const uint32_t output_pages_per_sample,
+    const uint32_t l1_alignment_bytes) {
     tt::tt_metal::ProgramDescriptor descriptor;
     add_narrow_tile_circular_buffer(descriptor, cores, kSrcTile0Cb, 2 * kTileGroupBuffering);
     add_narrow_tile_circular_buffer(descriptor, cores, kSrcTile1Cb, 2 * kTileGroupBuffering);
@@ -494,7 +505,7 @@ void add_narrow_tile_circular_buffer(
     add_circular_buffer(
         descriptor, cores, kSrcCacheCb, device_protocol::kLwtCacheStickCount, device_protocol::kStickBytes);
     add_circular_buffer(descriptor, cores, kInterleaveCb, 1, device_protocol::kStickBytes);
-    add_circular_buffer(descriptor, cores, kSyncCb, 1, kStorageAlignmentBytes);
+    add_circular_buffer(descriptor, cores, kSyncCb, 1, l1_alignment_bytes);
     add_circular_buffer(descriptor, cores, kReaderConfigCb, 1, device_protocol::kRouteConfigPageBytes);
     add_circular_buffer(descriptor, cores, kWriterConfigCb, 1, device_protocol::kRouteConfigPageBytes);
     add_workspace_circular_buffers(descriptor, cores, plan.workspace_elements, hybrid_tile_mirror);
@@ -571,6 +582,7 @@ void add_narrow_tile_circular_buffer(
         {"LWT_SCHEME_TYPE", compute_scheme_type},
         {"LWT_INLINE_TERMINAL_SCALE", "1"},
     };
+    add_generated_scheme_include_path(compute_descriptor);
     compute_descriptor.config = tt::tt_metal::ComputeConfigDescriptor{
         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
         .fp32_dest_acc_en = true,
@@ -604,30 +616,33 @@ void add_narrow_tile_circular_buffer(
     for (size_t chunk_index = 0; chunk_index < plan.chunks.size(); ++chunk_index) {
         const auto& chunk = plan.chunks[chunk_index];
         const size_t offset = chunk_index * device_protocol::kLwtChunkConfigWordCount;
-        words[offset + device_protocol::kIlwtApproximationBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtApproximationBegin)] =
             checked_u32(chunk.canonical_approximation.begin, "ILWT approximation begin");
-        words[offset + device_protocol::kIlwtApproximationLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtApproximationLength)] =
             checked_u32(chunk.canonical_approximation.length(), "ILWT approximation length");
-        words[offset + device_protocol::kIlwtDetailBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtDetailBegin)] =
             checked_u32(chunk.canonical_detail.begin, "ILWT detail begin");
-        words[offset + device_protocol::kIlwtDetailLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtDetailLength)] =
             checked_u32(chunk.canonical_detail.length(), "ILWT detail length");
-        words[offset + device_protocol::kIlwtFinalEvenAddr] = resolve_workspace_address(buffers, chunk.final_even);
-        words[offset + device_protocol::kIlwtFinalEvenStorageLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalEvenAddr)] =
+            resolve_workspace_address(buffers, chunk.final_even);
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalEvenStorageLength)] =
             checked_u32(chunk.final_even_storage_length, "ILWT final even storage length");
-        words[offset + device_protocol::kIlwtFinalEvenOffset] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalEvenOffset)] =
             checked_u32(chunk.final_even_offset_elements, "ILWT final even offset");
-        words[offset + device_protocol::kIlwtFinalEvenBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalEvenBegin)] =
             checked_u32(chunk.reconstructed_even.begin, "ILWT final even begin");
-        words[offset + device_protocol::kIlwtFinalOddAddr] = resolve_workspace_address(buffers, chunk.final_odd);
-        words[offset + device_protocol::kIlwtFinalOddStorageLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalOddAddr)] =
+            resolve_workspace_address(buffers, chunk.final_odd);
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalOddStorageLength)] =
             checked_u32(chunk.final_odd_storage_length, "ILWT final odd storage length");
-        words[offset + device_protocol::kIlwtFinalOddOffset] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalOddOffset)] =
             checked_u32(chunk.final_odd_offset_elements, "ILWT final odd offset");
-        words[offset + device_protocol::kIlwtFinalOddBegin] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtFinalOddBegin)] =
             checked_u32(chunk.reconstructed_odd.begin, "ILWT final odd begin");
-        words[offset + device_protocol::kIlwtOutputBegin] = checked_u32(chunk.output_signal.begin, "ILWT output begin");
-        words[offset + device_protocol::kIlwtOutputLength] =
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtOutputBegin)] =
+            checked_u32(chunk.output_signal.begin, "ILWT output begin");
+        words[offset + config_word_index(LwtChunkConfigWord::kIlwtOutputLength)] =
             checked_u32(chunk.output_signal.length(), "ILWT output length");
     }
     return words;
@@ -650,24 +665,28 @@ void add_narrow_tile_circular_buffer(
                 "ILWT intermediate route must target a local workspace slot");
             const size_t word_offset =
                 (chunk_index * route_count + route_index) * device_protocol::kRouteConfigWordCount;
-            words[word_offset + device_protocol::kRouteType] = static_cast<uint32_t>(route.type);
-            words[word_offset + device_protocol::kRouteSourceAddr] = resolve_workspace_address(buffers, route.source);
-            words[word_offset + device_protocol::kRouteSourceLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteType)] = static_cast<uint32_t>(route.type);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceAddr)] =
+                resolve_workspace_address(buffers, route.source);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceLength)] =
                 checked_u32(route.source_storage_length, "ILWT source storage length");
-            words[word_offset + device_protocol::kRouteBaseAddr] = resolve_workspace_address(buffers, route.base);
-            words[word_offset + device_protocol::kRouteBaseLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseAddr)] =
+                resolve_workspace_address(buffers, route.base);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseLength)] =
                 checked_u32(route.base_storage_length, "ILWT base storage length");
-            words[word_offset + device_protocol::kRouteOutputAddr] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputAddr)] =
                 resolve_workspace_address(buffers, StreamRef{.slot = route.output.slot});
-            words[word_offset + device_protocol::kRouteOutputLength] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputLength)] =
                 checked_u32(route.output_length, "ILWT output length");
-            words[word_offset + device_protocol::kRouteSourceOffset] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceOffset)] =
                 checked_u32(route.source_offset_elements, "ILWT source offset");
-            words[word_offset + device_protocol::kRouteBaseOffset] =
+            words[word_offset + config_word_index(RouteConfigWord::kRouteBaseOffset)] =
                 checked_u32(route.base_offset_elements, "ILWT base offset");
-            words[word_offset + device_protocol::kRouteSourceLeftPad] = route.source_left_pad_elements;
-            words[word_offset + device_protocol::kRouteOutputOffset] = 0;
-            words[word_offset + device_protocol::kRouteGroupCount] = output_group_count(route.output_length);
+            words[word_offset + config_word_index(RouteConfigWord::kRouteSourceLeftPad)] =
+                route.source_left_pad_elements;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteOutputOffset)] = 0;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteGroupCount)] =
+                output_group_count(route.output_length);
             uint32_t route_flags = plan.final_interleave_direct && route_index + 1 == route_count
                                        ? device_protocol::kRouteFlagIlwtFinalInterleave
                                        : 0U;
@@ -679,7 +698,7 @@ void add_narrow_tile_circular_buffer(
                                : 0U;
             route_flags |= device_protocol::kRouteFlagOutputTileMirror;
             tile_mirror_valid[static_cast<size_t>(route.output.slot)] = true;
-            words[word_offset + device_protocol::kRouteFlags] = route_flags;
+            words[word_offset + config_word_index(RouteConfigWord::kRouteFlags)] = route_flags;
         }
     }
     return words;
@@ -762,7 +781,8 @@ void add_narrow_tile_circular_buffer(
     const std::vector<CoreChunkWork>& work,
     const uint32_t chunks_per_sample,
     const uint32_t input_pages_per_sample,
-    const uint32_t output_pages_per_sample) {
+    const uint32_t output_pages_per_sample,
+    const uint32_t l1_alignment_bytes) {
     tt::tt_metal::ProgramDescriptor descriptor;
     add_narrow_tile_circular_buffer(descriptor, cores, kSrcTile0Cb, 2 * kTileGroupBuffering);
     add_narrow_tile_circular_buffer(descriptor, cores, kSrcTile1Cb, 2 * kTileGroupBuffering);
@@ -771,7 +791,7 @@ void add_narrow_tile_circular_buffer(
     add_circular_buffer(
         descriptor, cores, kSrcCacheCb, device_protocol::kLwtCacheStickCount, device_protocol::kStickBytes);
     add_circular_buffer(descriptor, cores, kInterleaveCb, interleave_batch_sticks, device_protocol::kStickBytes);
-    add_circular_buffer(descriptor, cores, kSyncCb, 1, kStorageAlignmentBytes);
+    add_circular_buffer(descriptor, cores, kSyncCb, 1, l1_alignment_bytes);
     add_circular_buffer(descriptor, cores, kReaderConfigCb, 1, device_protocol::kRouteConfigPageBytes);
     add_circular_buffer(descriptor, cores, kWriterConfigCb, 1, device_protocol::kRouteConfigPageBytes);
     add_workspace_circular_buffers(descriptor, cores, plan.workspace_elements, hybrid_tile_mirror);
@@ -847,6 +867,7 @@ void add_narrow_tile_circular_buffer(
         {"ILWT_SCHEME_TYPE", compute_scheme_type},
         {"ILWT_INLINE_INVERSE_SCALE", "1"},
     };
+    add_generated_scheme_include_path(compute_descriptor);
     compute_descriptor.config = tt::tt_metal::ComputeConfigDescriptor{
         .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
         .fp32_dest_acc_en = true,
@@ -889,8 +910,6 @@ void validate_1d_tensor(const Tensor& tensor, const char* tensor_name) {
     TT_FATAL(shape.length > 0, "{} must be non-empty", tensor_name);
     validate_input_memory_config(tensor.memory_config(), tensor_name);
 
-    // Stick-native shapes expose their complete allocated capacity, including
-    // unspecified final-stick lanes, so validate the complete physical volume.
     const uint64_t physical_bytes = static_cast<uint64_t>(tensor.physical_volume()) * sizeof(float);
     TT_FATAL(
         tensor.buffer()->size() >= physical_bytes,
@@ -903,7 +922,7 @@ void validate_1d_tensor(const Tensor& tensor, const char* tensor_name) {
 
 [[nodiscard]] tt::tt_metal::TensorSpec output_spec_1d(
     const Logical1DShape& input_shape, const uint32_t length, const MemoryConfig& memory_config) {
-    const uint32_t stick_count = checked_u32(ceil_div(length, kStickWidth), "1D wavelet output stick count");
+    const uint32_t stick_count = checked_u32(tt::div_up(length, kStickWidth), "1D wavelet output stick count");
     const Shape output_shape = input_shape.rank_four ? Shape({input_shape.batch_count, 1, stick_count, kStickWidth})
                                                      : Shape({stick_count, kStickWidth});
     return tt::tt_metal::TensorSpec(
@@ -912,7 +931,7 @@ void validate_1d_tensor(const Tensor& tensor, const char* tensor_name) {
             DataType::FLOAT32,
             tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
             memory_config,
-            tt::tt_metal::Alignment{kStorageAlignmentBytes}));
+            tt::tt_metal::Alignment{kStickWidth}));
 }
 
 void validate_preallocated_output(
@@ -952,9 +971,6 @@ template <typename Scheme>
         .element_size_bytes = sizeof(float),
     };
     LiftingForwardPlan full_plan = make_forward_lifting_plan<Scheme>(input, boundary_mode);
-    TT_FATAL(
-        full_plan.preprocess_layout.padded_length() <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
-        "LWT padded input length exceeds the device signed-index range");
 
     const uint32_t max_cores =
         wavelet_program_utils::worker_core_count(mesh_device, "LWT requires at least one hardware worker core");
@@ -1003,10 +1019,6 @@ template <typename Scheme>
     TT_FATAL(architecture_policy.inverse_scale_inline, "ILWT must preserve inline FP32 inverse scaling");
     LiftingInversePlan full_plan =
         make_inverse_lifting_plan<Scheme>(original_length, coefficient_length, boundary_mode);
-    TT_FATAL(
-        full_plan.forward_trace.preprocess_layout.padded_length() <=
-            static_cast<size_t>(std::numeric_limits<int32_t>::max()),
-        "ILWT padded signal length exceeds the device signed-index range");
     IlwtExecutionPlan plan = make_ilwt_execution_plan(
         std::move(full_plan),
         wavelet_program_utils::worker_core_count(mesh_device, "LWT requires at least one hardware worker core"),
@@ -1147,6 +1159,7 @@ template <typename Scheme>
         pages_per_batch_item(tensor_args.input, input_shape.batch_count, "LWT input");
     const uint32_t output_pages_per_sample =
         pages_per_batch_item(std::get<0>(tensor_return_value), input_shape.batch_count, "LWT approximation output");
+    const uint32_t l1_alignment_bytes = mesh_device.allocator()->get_alignment(tt::tt_metal::BufferType::L1);
     auto descriptor = create_forward_program_descriptor(
         core_range_set(buffers.cores),
         input_buffer,
@@ -1161,7 +1174,8 @@ template <typename Scheme>
         work,
         chunks_per_sample,
         input_pages_per_sample,
-        output_pages_per_sample);
+        output_pages_per_sample,
+        l1_alignment_bytes);
     wavelet_program_utils::append_program_to_mesh_ranges(
         workload, std::move(descriptor), tensor_coords, "Wavelet workload has no mesh coordinate range");
     return workload;
@@ -1275,6 +1289,7 @@ template <typename Scheme>
         pages_per_batch_item(tensor_args.approximation, coefficient_shape.batch_count, "ILWT approximation");
     const uint32_t output_pages_per_sample =
         pages_per_batch_item(tensor_return_value, coefficient_shape.batch_count, "ILWT output");
+    const uint32_t l1_alignment_bytes = mesh_device.allocator()->get_alignment(tt::tt_metal::BufferType::L1);
     auto descriptor = create_inverse_program_descriptor(
         core_range_set(buffers.cores),
         approximation_buffer,
@@ -1290,7 +1305,8 @@ template <typename Scheme>
         work,
         chunks_per_sample,
         input_pages_per_sample,
-        output_pages_per_sample);
+        output_pages_per_sample,
+        l1_alignment_bytes);
     wavelet_program_utils::append_program_to_mesh_ranges(
         workload, std::move(descriptor), tensor_coords, "Wavelet workload has no mesh coordinate range");
     return workload;

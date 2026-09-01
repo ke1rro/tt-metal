@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "tt-metalium/math.hpp"
 #include "ttnn/operations/wavelet/common/signal.hpp"
 #include "ttnn/operations/wavelet/common/storage_contract.hpp"
 #include "ttnn/operations/wavelet/device/protocol/lwt_config.hpp"
@@ -214,12 +215,12 @@ inline void validate_inverse_scale_inline(const LiftingForwardPlan& plan) {
 
     const size_t padded_begin = output_signal.begin + pad;
     const size_t padded_end = output_signal.end + pad;
-    const IndexInterval target_even{.begin = (padded_begin + 1) / 2, .end = (padded_end + 1) / 2};
+    const IndexInterval target_even{
+        .begin = tt::div_up(padded_begin, size_t{2}), .end = tt::div_up(padded_end, size_t{2})};
     const IndexInterval target_odd{.begin = padded_begin / 2, .end = padded_end / 2};
     const std::vector<RequiredStreams> required = propagate_requirements(plan, target_even, target_odd);
 
     const int canonical_start = static_cast<int>(plan.preprocess_layout.pad_config.left + 1) / 2;
-    // tap_size / 2 equals (left_pad + 1) / 2 because left_pad = tap_size - 1.
     const IndexInterval canonical_approximation = canonical_interval(
         required.back().even, plan.final_even_shift, canonical_start, inverse_plan.coefficient_length, "approximation");
     const IndexInterval canonical_detail = canonical_interval(
@@ -248,10 +249,6 @@ inline void validate_inverse_scale_inline(const LiftingForwardPlan& plan) {
             continue;
         }
 
-        // The inverse scheme starts with the reciprocal of the two terminal
-        // forward scales. When enabled, compute applies both reciprocal
-        // scales to the first predict/update inputs before the stencil, so no
-        // scaled stream needs a separate workspace slot.
         if (route_index + 2 >= plan.routes.size()) {
             TT_FATAL(is_scale_step(forward_route.type), "Only terminal inverse scales may be applied inline");
             continue;
@@ -358,7 +355,7 @@ inline void validate_inverse_scale_inline(const LiftingForwardPlan& plan) {
     const LiftingInversePlan& plan, const uint32_t requested_chunk_count) {
     TT_FATAL(requested_chunk_count > 0, "ILWT chunk count must be non-zero");
     constexpr size_t output_group_elements = 2 * device_protocol::kLwtGroupOutputElements;
-    const size_t output_group_count = std::max(ceil_div(plan.original_length, output_group_elements), size_t{1});
+    const size_t output_group_count = std::max(tt::div_up(plan.original_length, output_group_elements), size_t{1});
     const size_t chunk_count = std::min(static_cast<size_t>(requested_chunk_count), output_group_count);
     const size_t base_groups = output_group_count / chunk_count;
     const size_t extra_groups = output_group_count % chunk_count;
@@ -419,7 +416,7 @@ template <typename Scheme>
 
     constexpr size_t output_group_elements = 2 * device_protocol::kLwtGroupOutputElements;
     const uint32_t final_group_count =
-        static_cast<uint32_t>(std::max(ceil_div(full_plan.original_length, output_group_elements), size_t{1}));
+        static_cast<uint32_t>(std::max(tt::div_up(full_plan.original_length, output_group_elements), size_t{1}));
     uint32_t chunk_count = std::min(final_group_count, core_limit);
     std::vector<IlwtChunkPlan> chunks;
     uint32_t workspace_elements = 0;
@@ -434,7 +431,7 @@ template <typename Scheme>
         const size_t workspace_alignment = workspace_layout == WorkspaceLayout::kTileNative
                                                ? static_cast<size_t>(device_protocol::kLwtGroupOutputElements)
                                                : static_cast<size_t>(kStickWidth);
-        const size_t aligned_workspace = round_up(candidate_max_workspace_elements, workspace_alignment);
+        const size_t aligned_workspace = tt::round_up(candidate_max_workspace_elements, workspace_alignment);
         TT_FATAL(
             aligned_workspace > 0 && aligned_workspace <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()),
             "ILWT workspace length {} is invalid",
@@ -464,10 +461,12 @@ template <typename Scheme>
     }
 
     const uint32_t groups_per_chunk =
-        static_cast<uint32_t>(ceil_div(static_cast<size_t>(final_group_count), chunks.size()));
-    double max_dependency_overhead = 0.0;
+        static_cast<uint32_t>(tt::div_up(static_cast<size_t>(final_group_count), chunks.size()));
+    const auto max_dependency =
+        std::max_element(chunks.begin(), chunks.end(), [](const IlwtChunkPlan& lhs, const IlwtChunkPlan& rhs) {
+            return lhs.dependency_overhead < rhs.dependency_overhead;
+        });
     for (const auto& chunk : chunks) {
-        max_dependency_overhead = std::max(max_dependency_overhead, chunk.dependency_overhead);
         TT_FATAL(!chunk.routes.empty(), "ILWT requires at least one inverse predict/update route");
         if (final_interleave_direct) {
             const auto& final_route = chunk.routes.back();
@@ -493,7 +492,7 @@ template <typename Scheme>
         .output_groups_per_chunk = groups_per_chunk,
         .workspace_elements = workspace_elements,
         .max_workspace_elements = max_workspace_elements,
-        .max_dependency_overhead = max_dependency_overhead,
+        .max_dependency_overhead = max_dependency->dependency_overhead,
         .final_interleave_direct = final_interleave_direct,
         .workspace_layout = workspace_layout,
     };
