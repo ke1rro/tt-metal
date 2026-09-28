@@ -49,6 +49,23 @@ ALWI uint32_t resolve_workspace_slot(
     return slot == 0 ? workspace_a_addr : (slot == 1 ? workspace_b_addr : workspace_scratch_addr);
 }
 
+ALWI void copy_workspace_words(float* dst, const volatile tt_l1_ptr float* src, const uint32_t count) {
+    uint32_t index = 0;
+    for (; index + 4 <= count; index += 4) {
+        const float value0 = src[index];
+        const float value1 = src[index + 1];
+        const float value2 = src[index + 2];
+        const float value3 = src[index + 3];
+        dst[index] = value0;
+        dst[index + 1] = value1;
+        dst[index + 2] = value2;
+        dst[index + 3] = value3;
+    }
+    for (; index < count; ++index) {
+        dst[index] = src[index];
+    }
+}
+
 ALWI void read_workspace_block(const volatile tt_l1_ptr float* src, WorkspaceIndexCursor& cursor, float* dst) {
     const uint32_t initial_lane = cursor.lane;
     const uint32_t first_count = kBlockElements - initial_lane;
@@ -331,7 +348,7 @@ ALWI void initialize_inverse_stream(
     ttnn::operations::wavelet::kernels::primitives::release_cache(input_cache);
 }
 
-template <bool BoundsChecked>
+template <bool BoundsChecked, bool GroupedStaging>
 ALWI void fill_source_row_major(
     const volatile tt_l1_ptr float* src,
     float* src_tiles01,
@@ -348,6 +365,10 @@ ALWI void fill_source_row_major(
             const int32_t logical_start =
                 static_cast<int32_t>(source_offset) - static_cast<int32_t>(source_left_pad) +
                 static_cast<int32_t>(group_base + (row * kOutputBlocksPerRow + block) * kBlockElements);
+            if constexpr (!BoundsChecked && GroupedStaging) {
+                copy_workspace_words(tile_row, src + static_cast<uint32_t>(logical_start), kBlockElements);
+                continue;
+            }
 #pragma GCC unroll 8
             for (uint32_t lane = 0; lane < kBlockElements; ++lane) {
                 const int32_t logical_index = logical_start + static_cast<int32_t>(lane);
@@ -363,7 +384,7 @@ ALWI void fill_source_row_major(
     }
 }
 
-template <bool BoundsChecked>
+template <bool BoundsChecked, bool GroupedStaging>
 ALWI void fill_output_row_major(
     const volatile tt_l1_ptr float* src,
     float* narrow_tiles,
@@ -375,6 +396,10 @@ ALWI void fill_output_row_major(
         for (uint32_t block = 0; block < kOutputBlocksPerRow; ++block) {
             auto* tile_block = narrow_tiles + block * kNarrowTileElements + row * kBlockElements;
             const uint32_t output_index = group_base + (row * kOutputBlocksPerRow + block) * kBlockElements;
+            if constexpr (!BoundsChecked && GroupedStaging) {
+                copy_workspace_words(tile_block, src + source_offset + output_index, kBlockElements);
+                continue;
+            }
 #pragma GCC unroll 8
             for (uint32_t lane = 0; lane < kBlockElements; ++lane) {
                 const uint32_t local_index = output_index + lane;
@@ -460,7 +485,7 @@ ALWI void fill_output_narrow_tiles(
     }
 }
 
-template <bool TileNative, bool RowMajorNocStaging, bool HybridTileMirror>
+template <bool TileNative, bool RowMajorNocStaging, bool HybridTileMirror, bool GroupedStaging>
 ALWI void emit_predict_update_tiles(
     const uint32_t source_addr,
     const uint32_t base_addr,
@@ -534,16 +559,16 @@ ALWI void emit_predict_update_tiles(
                             source_addr, source_begin, source0_buffer.get_write_ptr(), source1_buffer.get_write_ptr());
                         needs_read_barrier = true;
                     } else {
-                        fill_source_row_major<false>(
+                        fill_source_row_major<false, GroupedStaging>(
                             src, src_tiles01, src_tiles23, source_end, source_offset, source_left_pad, group_base);
                     }
                 } else {
-                    fill_source_row_major<false>(
+                    fill_source_row_major<false, GroupedStaging>(
                         src, src_tiles01, src_tiles23, source_end, source_offset, source_left_pad, group_base);
                 }
             }
         } else {
-            fill_source_row_major<true>(
+            fill_source_row_major<true, GroupedStaging>(
                 src, src_tiles01, src_tiles23, source_end, source_offset, source_left_pad, group_base);
         }
 
@@ -577,15 +602,17 @@ ALWI void emit_predict_update_tiles(
                         read_row_major_output_group(base_addr, base_begin, base_buffer.get_write_ptr());
                         needs_read_barrier = true;
                     } else {
-                        fill_output_row_major<false>(
+                        fill_output_row_major<false, GroupedStaging>(
                             base, base_tiles, base_end, base_offset, output_length, group_base);
                     }
                 } else {
-                    fill_output_row_major<false>(base, base_tiles, base_end, base_offset, output_length, group_base);
+                    fill_output_row_major<false, GroupedStaging>(
+                        base, base_tiles, base_end, base_offset, output_length, group_base);
                 }
             }
         } else {
-            fill_output_row_major<true>(base, base_tiles, base_end, base_offset, output_length, group_base);
+            fill_output_row_major<true, GroupedStaging>(
+                base, base_tiles, base_end, base_offset, output_length, group_base);
         }
         if (needs_read_barrier) {
             noc.async_read_barrier();
@@ -597,7 +624,7 @@ ALWI void emit_predict_update_tiles(
     }
 }
 
-template <bool TileNative, bool RowMajorNocStaging, bool HybridTileMirror>
+template <bool TileNative, bool RowMajorNocStaging, bool HybridTileMirror, bool GroupedStaging>
 ALWI void emit_scale_tiles(
     const uint32_t source_addr,
     const uint32_t cb_scale_tile,
@@ -645,16 +672,17 @@ ALWI void emit_scale_tiles(
                         read_row_major_output_group(source_addr, source_begin, scale_buffer.get_write_ptr());
                         noc.async_read_barrier();
                     } else {
-                        fill_output_row_major<false>(
+                        fill_output_row_major<false, GroupedStaging>(
                             src, scale_tiles, source_end, source_offset, output_length, group_base);
                     }
                 } else {
-                    fill_output_row_major<false>(
+                    fill_output_row_major<false, GroupedStaging>(
                         src, scale_tiles, source_end, source_offset, output_length, group_base);
                 }
             }
         } else {
-            fill_output_row_major<true>(src, scale_tiles, source_end, source_offset, output_length, group_base);
+            fill_output_row_major<true, GroupedStaging>(
+                src, scale_tiles, source_end, source_offset, output_length, group_base);
         }
         scale_buffer.push_back(kOutputBlocksPerRow);
     }
@@ -689,6 +717,11 @@ void kernel_main() {
     constexpr uint32_t input_page_size = get_compile_time_arg_val(9);
     constexpr bool row_major_noc_staging = get_compile_time_arg_val(10) != 0;
     constexpr bool hybrid_tile_mirror = get_compile_time_arg_val(11) != 0;
+#if defined(ARCH_WORMHOLE)
+    constexpr bool grouped_staging = !row_major_noc_staging;
+#else
+    constexpr bool grouped_staging = false;
+#endif
     constexpr uint32_t cb_workspace_a = get_compile_time_arg_val(12);
     constexpr uint32_t cb_workspace_b = get_compile_time_arg_val(13);
     constexpr uint32_t cb_workspace_scratch = get_compile_time_arg_val(14);
@@ -803,7 +836,11 @@ void kernel_main() {
                 (route_flags & ttnn::operations::wavelet::device_protocol::kRouteFlagBaseTileMirror) != 0;
 
             if (route_type == kStepPredict || route_type == kStepUpdate) {
-                emit_predict_update_tiles<tile_native_workspace, row_major_noc_staging, hybrid_tile_mirror>(
+                emit_predict_update_tiles<
+                    tile_native_workspace,
+                    row_major_noc_staging,
+                    hybrid_tile_mirror,
+                    grouped_staging>(
                     source_addr,
                     base_addr,
                     cb_src_tile0,
@@ -820,7 +857,7 @@ void kernel_main() {
                     source_tile_mirror,
                     base_tile_mirror);
             } else if (route_type == kStepScaleEven || route_type == kStepScaleOdd) {
-                emit_scale_tiles<tile_native_workspace, row_major_noc_staging, hybrid_tile_mirror>(
+                emit_scale_tiles<tile_native_workspace, row_major_noc_staging, hybrid_tile_mirror, grouped_staging>(
                     source_addr,
                     cb_base_tile,
                     source_end,

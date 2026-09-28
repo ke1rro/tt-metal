@@ -911,7 +911,18 @@ classify_route_tile(const Rect& stored, const int32_t requested_y, const int32_t
 
 ALWI void copy_contiguous_words(
     volatile tt_l1_ptr uint32_t* destination, const volatile tt_l1_ptr uint32_t* source, const uint32_t word_count) {
-    for (uint32_t word = 0; word < word_count; ++word) {
+    uint32_t word = 0;
+    for (; word + 4 <= word_count; word += 4) {
+        const uint32_t value0 = source[word];
+        const uint32_t value1 = source[word + 1];
+        const uint32_t value2 = source[word + 2];
+        const uint32_t value3 = source[word + 3];
+        destination[word] = value0;
+        destination[word + 1] = value1;
+        destination[word + 2] = value2;
+        destination[word + 3] = value3;
+    }
+    for (; word < word_count; ++word) {
         destination[word] = source[word];
     }
 }
@@ -989,6 +1000,58 @@ __attribute__((noinline)) void assemble_bounded_tile(
     }
 }
 
+[[nodiscard]] __attribute__((noinline)) bool assemble_bounded_face_aligned_tile(
+    const uint32_t destination_addr,
+    const uint32_t plane_addr,
+    const uint32_t plane_tile_columns,
+    const Rect& stored,
+    const int32_t requested_y,
+    const int32_t requested_x) {
+    const int32_t valid_y_begin = std::max(requested_y, static_cast<int32_t>(stored.y_begin));
+    const int32_t valid_y_end =
+        std::min(requested_y + static_cast<int32_t>(kTileSide), static_cast<int32_t>(stored.y_begin + stored.y_length));
+    if (valid_y_begin >= valid_y_end) {
+        return true;
+    }
+    const int32_t valid_x_begin = std::max(requested_x, static_cast<int32_t>(stored.x_begin));
+    const int32_t valid_x_end =
+        std::min(requested_x + static_cast<int32_t>(kTileSide), static_cast<int32_t>(stored.x_begin + stored.x_length));
+    if (valid_x_begin != requested_x || valid_x_end != requested_x + static_cast<int32_t>(kTileSide) ||
+        requested_x % static_cast<int32_t>(kFaceSide) != 0) {
+        return false;
+    }
+
+    Noc noc;
+    UnicastEndpoint local_endpoint;
+    const auto local_coordinates = ttnn::operations::wavelet::kernels::primitives::local_noc_coordinates(noc);
+    const uint32_t source_x = static_cast<uint32_t>(requested_x) - aligned_begin(stored.x_begin);
+    const uint32_t destination_y_begin = static_cast<uint32_t>(valid_y_begin - requested_y);
+    const uint32_t destination_y_end = static_cast<uint32_t>(valid_y_end - requested_y);
+    uint32_t destination_y = destination_y_begin;
+    uint32_t source_y = static_cast<uint32_t>(valid_y_begin) - aligned_begin(stored.y_begin);
+    while (destination_y < destination_y_end) {
+        const uint32_t rows = std::min(
+            destination_y_end - destination_y,
+            std::min(kFaceSide - destination_y % kFaceSide, kFaceSide - source_y % kFaceSide));
+        for (uint32_t column = 0; column < kTileSide; column += kFaceSide) {
+            noc.async_read(
+                local_endpoint,
+                CoreLocalMem<uint32_t>(
+                    destination_addr + tile_element_offset(destination_y, column) * sizeof(uint32_t)),
+                rows * kFaceSide * sizeof(uint32_t),
+                ttnn::operations::wavelet::kernels::primitives::local_noc_source(
+                    local_coordinates,
+                    plane_addr +
+                        tiled_element_offset(source_y, source_x + column, plane_tile_columns) * sizeof(uint32_t)),
+                {});
+        }
+        destination_y += rows;
+        source_y += rows;
+    }
+    noc.async_read_barrier();
+    return true;
+}
+
 [[nodiscard]] __attribute__((noinline)) StageTileResult stage_optimized_tile(
     const uint32_t cb,
     const uint32_t zero_tile_addr,
@@ -1026,6 +1089,28 @@ __attribute__((noinline)) void assemble_bounded_tile(
     }
 
     if (tile_class == RouteTileClass::kOneAxisShifted) {
+        if (requested_x % static_cast<int32_t>(kFaceSide) == 0) {
+            const auto local_coordinates = ttnn::operations::wavelet::kernels::primitives::local_noc_coordinates(noc);
+            uint32_t row = 0;
+            while (row < kTileSide) {
+                const uint32_t source_y = static_cast<uint32_t>(requested_y) + row - aligned_begin(stored.y_begin);
+                const uint32_t source_x = static_cast<uint32_t>(requested_x) - aligned_begin(stored.x_begin);
+                const uint32_t rows = std::min(kFaceSide - source_y % kFaceSide, kFaceSide - row % kFaceSide);
+                for (uint32_t column = 0; column < kTileSide; column += kFaceSide) {
+                    noc.async_read(
+                        local_endpoint,
+                        CoreLocalMem<uint32_t>(destination_addr + tile_element_offset(row, column) * sizeof(uint32_t)),
+                        rows * kFaceSide * sizeof(uint32_t),
+                        ttnn::operations::wavelet::kernels::primitives::local_noc_source(
+                            local_coordinates,
+                            plane_addr + tiled_element_offset(source_y, source_x + column, plane_tile_columns) *
+                                             sizeof(uint32_t)),
+                        {});
+                }
+                row += rows;
+            }
+            return StageTileResult::kExactPending;
+        }
         assemble_one_axis_shifted_tile(
             destination_addr, plane_addr, plane_tile_columns, stored, requested_y, requested_x);
     } else {
@@ -1042,14 +1127,19 @@ __attribute__((noinline)) void finish_pending_tile(
     const uint32_t plane_tile_columns,
     const Rect& stored,
     const int32_t requested_y,
-    const int32_t requested_x) {
+    const int32_t requested_x,
+    const bool use_partial_face_dma) {
     if (result == StageTileResult::kCompleted) {
         return;
     }
     CircularBuffer buffer(cb);
     const uint32_t destination_addr = buffer.get_write_ptr();
     if (result == StageTileResult::kBoundedPending) {
-        assemble_bounded_tile(destination_addr, plane_addr, plane_tile_columns, stored, requested_y, requested_x);
+        if (!use_partial_face_dma ||
+            !assemble_bounded_face_aligned_tile(
+                destination_addr, plane_addr, plane_tile_columns, stored, requested_y, requested_x)) {
+            assemble_bounded_tile(destination_addr, plane_addr, plane_tile_columns, stored, requested_y, requested_x);
+        }
     }
     buffer.push_back(1);
 }
@@ -1129,6 +1219,13 @@ void kernel_main() {
     const uint32_t chunk_begin = get_arg_val<uint32_t>(plane_arg_base + plane_arg_count + 2);
     const uint32_t chunk_count = get_arg_val<uint32_t>(plane_arg_base + plane_arg_count + 3);
     const uint32_t route_count = get_arg_val<uint32_t>(plane_arg_base + plane_arg_count + 4);
+#if defined(ARCH_WORMHOLE) && defined(ILWT_2D)
+    const bool use_partial_face_dma = input_height >= 512 && input_width >= 512;
+#elif defined(ARCH_WORMHOLE)
+    const bool use_partial_face_dma = route_count >= 20;
+#else
+    constexpr bool use_partial_face_dma = false;
+#endif
     const uint32_t chunks_per_sample = get_arg_val<uint32_t>(plane_arg_base + plane_arg_count + 5);
     const uint32_t input_tiles_per_sample = get_arg_val<uint32_t>(plane_arg_base + plane_arg_count + 6);
 
@@ -1333,7 +1430,8 @@ void kernel_main() {
                         plane_tile_columns[source_slot],
                         stored[source_slot],
                         source0_requested_y,
-                        source0_requested_x);
+                        source0_requested_x,
+                        use_partial_face_dma);
                     finish_pending_tile(
                         source1_result,
                         cb_source1,
@@ -1341,7 +1439,8 @@ void kernel_main() {
                         plane_tile_columns[source_slot],
                         stored[source_slot],
                         source1_requested_y,
-                        source1_requested_x);
+                        source1_requested_x,
+                        use_partial_face_dma);
                     finish_pending_tile(
                         base_result,
                         cb_base,
@@ -1349,7 +1448,8 @@ void kernel_main() {
                         plane_tile_columns[base_slot],
                         stored[base_slot],
                         base_requested_tile_y,
-                        base_requested_tile_x);
+                        base_requested_tile_x,
+                        use_partial_face_dma);
                 }
             }
             sync_buffer.wait_front(1);
