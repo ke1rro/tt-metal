@@ -49,9 +49,9 @@ ALWI uint32_t resolve_workspace_slot(
     return slot == 0 ? workspace_a_addr : (slot == 1 ? workspace_b_addr : workspace_scratch_addr);
 }
 
-ALWI void copy_workspace_words(float* dst, const volatile tt_l1_ptr float* src, const uint32_t count) {
-    uint32_t index = 0;
-    for (; index + 4 <= count; index += 4) {
+ALWI void copy_workspace_block(float* dst, const volatile tt_l1_ptr float* src) {
+    static_assert(kBlockElements % 4 == 0);
+    for (uint32_t index = 0; index < kBlockElements; index += 4) {
         const float value0 = src[index];
         const float value1 = src[index + 1];
         const float value2 = src[index + 2];
@@ -60,9 +60,6 @@ ALWI void copy_workspace_words(float* dst, const volatile tt_l1_ptr float* src, 
         dst[index + 1] = value1;
         dst[index + 2] = value2;
         dst[index + 3] = value3;
-    }
-    for (; index < count; ++index) {
-        dst[index] = src[index];
     }
 }
 
@@ -82,28 +79,18 @@ ALWI void read_workspace_block(const volatile tt_l1_ptr float* src, WorkspaceInd
     cursor.physical += initial_lane;
 }
 
-template <bool BoundsChecked>
-ALWI void read_workspace_block(
+ALWI void read_bounded_workspace_block(
     const volatile tt_l1_ptr float* src, const int32_t logical_start, const uint32_t logical_end, float* dst) {
-    if constexpr (BoundsChecked) {
-        const uint32_t negative_magnitude = 0U - static_cast<uint32_t>(logical_start);
-        const uint32_t zero_prefix =
-            logical_start < 0 ? (negative_magnitude < kBlockElements ? negative_magnitude : kBlockElements) : 0;
-        const uint32_t valid_start = logical_start < 0 ? 0U : static_cast<uint32_t>(logical_start);
-        WorkspaceIndexCursor cursor(valid_start);
+    const uint32_t negative_magnitude = 0U - static_cast<uint32_t>(logical_start);
+    const uint32_t zero_prefix =
+        logical_start < 0 ? (negative_magnitude < kBlockElements ? negative_magnitude : kBlockElements) : 0;
+    const uint32_t valid_start = logical_start < 0 ? 0U : static_cast<uint32_t>(logical_start);
+    WorkspaceIndexCursor cursor(valid_start);
 #pragma GCC unroll 8
-        for (uint32_t lane = 0; lane < kBlockElements; ++lane) {
-            const bool valid = lane >= zero_prefix && valid_start + lane - zero_prefix < logical_end;
-            dst[lane] = valid ? src[cursor.physical] : 0.0F;
-            if (valid) {
-                cursor.advance();
-            }
-        }
-    } else {
-        WorkspaceIndexCursor cursor(static_cast<uint32_t>(logical_start));
-#pragma GCC unroll 8
-        for (uint32_t lane = 0; lane < kBlockElements; ++lane) {
-            dst[lane] = src[cursor.physical];
+    for (uint32_t lane = 0; lane < kBlockElements; ++lane) {
+        const bool valid = lane >= zero_prefix && valid_start + lane - zero_prefix < logical_end;
+        dst[lane] = valid ? src[cursor.physical] : 0.0F;
+        if (valid) {
             cursor.advance();
         }
     }
@@ -366,7 +353,7 @@ ALWI void fill_source_row_major(
                 static_cast<int32_t>(source_offset) - static_cast<int32_t>(source_left_pad) +
                 static_cast<int32_t>(group_base + (row * kOutputBlocksPerRow + block) * kBlockElements);
             if constexpr (!BoundsChecked && GroupedStaging) {
-                copy_workspace_words(tile_row, src + static_cast<uint32_t>(logical_start), kBlockElements);
+                copy_workspace_block(tile_row, src + static_cast<uint32_t>(logical_start));
                 continue;
             }
 #pragma GCC unroll 8
@@ -397,7 +384,7 @@ ALWI void fill_output_row_major(
             auto* tile_block = narrow_tiles + block * kNarrowTileElements + row * kBlockElements;
             const uint32_t output_index = group_base + (row * kOutputBlocksPerRow + block) * kBlockElements;
             if constexpr (!BoundsChecked && GroupedStaging) {
-                copy_workspace_words(tile_block, src + source_offset + output_index, kBlockElements);
+                copy_workspace_block(tile_block, src + source_offset + output_index);
                 continue;
             }
 #pragma GCC unroll 8
@@ -438,18 +425,17 @@ ALWI void fill_source_narrow_tiles(
                 cursor.advance_block();
             }
         }
-        return;
-    }
-
-    for (uint32_t block = 0; block < 4; ++block) {
-        auto* narrow_tile =
-            block < 2 ? src_tiles01 + block * kNarrowTileElements : src_tiles23 + (block - 2) * kNarrowTileElements;
-        for (uint32_t row = 0; row < kRowsPerGroup; ++row) {
-            auto* tile_row = narrow_tile + row * kBlockElements;
-            const int32_t logical_start =
-                static_cast<int32_t>(source_offset) - static_cast<int32_t>(source_left_pad) +
-                static_cast<int32_t>(group_base + (row * kOutputBlocksPerRow + block) * kBlockElements);
-            read_workspace_block<BoundsChecked>(src, logical_start, source_end, tile_row);
+    } else {
+        for (uint32_t block = 0; block < 4; ++block) {
+            auto* narrow_tile =
+                block < 2 ? src_tiles01 + block * kNarrowTileElements : src_tiles23 + (block - 2) * kNarrowTileElements;
+            for (uint32_t row = 0; row < kRowsPerGroup; ++row) {
+                auto* tile_row = narrow_tile + row * kBlockElements;
+                const int32_t logical_start =
+                    static_cast<int32_t>(source_offset) - static_cast<int32_t>(source_left_pad) +
+                    static_cast<int32_t>(group_base + (row * kOutputBlocksPerRow + block) * kBlockElements);
+                read_bounded_workspace_block(src, logical_start, source_end, tile_row);
+            }
         }
     }
 }
@@ -470,17 +456,19 @@ ALWI void fill_output_narrow_tiles(
                 read_workspace_block(src, cursor, tile_block);
             }
         }
-        return;
-    }
-
-    for (uint32_t row = 0; row < kRowsPerGroup; ++row) {
-        for (uint32_t block = 0; block < kOutputBlocksPerRow; ++block) {
-            auto* tile_block = narrow_tiles + block * kNarrowTileElements + row * kBlockElements;
-            const uint32_t output_index = group_base + (row * kOutputBlocksPerRow + block) * kBlockElements;
-            const uint32_t available = source_offset < source_end ? source_end - source_offset : 0U;
-            const uint32_t logical_end = source_offset + (output_length < available ? output_length : available);
-            read_workspace_block<BoundsChecked>(
-                src, static_cast<int32_t>(source_offset) + static_cast<int32_t>(output_index), logical_end, tile_block);
+    } else {
+        const uint32_t available = source_offset < source_end ? source_end - source_offset : 0U;
+        const uint32_t logical_end = source_offset + (output_length < available ? output_length : available);
+        for (uint32_t row = 0; row < kRowsPerGroup; ++row) {
+            for (uint32_t block = 0; block < kOutputBlocksPerRow; ++block) {
+                auto* tile_block = narrow_tiles + block * kNarrowTileElements + row * kBlockElements;
+                const uint32_t output_index = group_base + (row * kOutputBlocksPerRow + block) * kBlockElements;
+                read_bounded_workspace_block(
+                    src,
+                    static_cast<int32_t>(source_offset) + static_cast<int32_t>(output_index),
+                    logical_end,
+                    tile_block);
+            }
         }
     }
 }

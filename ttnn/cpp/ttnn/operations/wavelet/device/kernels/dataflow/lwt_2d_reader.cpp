@@ -1223,6 +1223,8 @@ void kernel_main() {
     const bool use_partial_face_dma = input_height >= 512 && input_width >= 512;
 #elif defined(ARCH_WORMHOLE)
     const bool use_partial_face_dma = route_count >= 20;
+#elif defined(ARCH_BLACKHOLE)
+    const bool use_partial_face_dma = input_height >= 512 && input_width >= 512 && route_count >= 20;
 #else
     constexpr bool use_partial_face_dma = false;
 #endif
@@ -1258,14 +1260,12 @@ void kernel_main() {
 #endif
     CircularBuffer sync_buffer(cb_sync);
     Noc noc;
-    // This CB is an L1 allocation only
     const uint32_t zero_tile_addr = CircularBuffer(cb_route_zero).get_write_ptr();
     auto* zero_tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zero_tile_addr);
     for (uint32_t word = 0; word < kTileElements; ++word) {
         zero_tile[word] = 0;
     }
     const uint32_t noc_scratch_addr = CircularBuffer(cb_noc_scratch).get_write_ptr();
-    // Writer access begins after the first output tile and its chunk-end sync prevents reader restaging.
     const uint32_t reader_config_addr = noc_scratch_addr;
 
     for (uint32_t local_chunk = 0; local_chunk < chunk_count; ++local_chunk) {
